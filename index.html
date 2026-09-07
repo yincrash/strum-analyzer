@@ -89,6 +89,7 @@
       <div class="needle live" id="needleLive"></div>
       <div class="needle" id="needleLast"></div>
     </div>
+    <div class="status err" id="warn" hidden style="margin-top:8px;font-weight:600"></div>
     <div class="live">Live: <b id="liveHz">—</b> Hz &nbsp;·&nbsp; note <b id="liveNote">—</b> &nbsp;·&nbsp; clarity <b id="liveClar">—</b> &nbsp;·&nbsp; FFT peak <b id="fftHz">—</b> Hz</div>
   </div>
 
@@ -117,6 +118,7 @@
       <li>The FFT peak reading is a second opinion. If it disagrees by a factor of 2 the detector may be picking an octave; trust the one nearest the strongest spectrum bump.</li>
     </ul>
   </details>
+  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v3 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
 </div>
 
 <script>
@@ -124,6 +126,7 @@
   const $ = id => document.getElementById(id);
   const EVENT_MAX_MS = 2000;
   const FFT_PROMINENCE_DB = 12;     // FFT peak must stand this far above the median level in the search range
+  const WIDE_LO = 20, WIDE_HI = 1200; // Hz, range scanned for a stronger tone outside the user's search range
   const STORE_KEY = 'belt-strum-tuner';
 
   // Target presets. lo/hi in Hz. Sources are listed in the README.
@@ -254,6 +257,13 @@
     if (p && p.clarity >= Math.max(clarityMin, 0.9)) return { hz: p.freq, src: 'pitch' };
     return null;
   }
+  // A prominent tone outside the search range that beats the in-range peak by a clear margin.
+  function outsideTone(wide, fp, lo, hi) {
+    if (!wide || wide.prominence < FFT_PROMINENCE_DB) return null;
+    if (wide.freq >= lo && wide.freq <= hi) return null;
+    if (fp && fp.db >= wide.db - 6) return null;
+    return wide;
+  }
   // Summarize a strum event into one reading.
   function summarize(e) {
     if (e.pitch.length >= 2) return { hz: median(e.pitch), src: 'peak+pitch', n: e.pitch.length };
@@ -355,15 +365,18 @@
     if (!history.length) { h.innerHTML = '<div style="color:var(--muted)">No strums yet.</div>'; return; }
     h.innerHTML = history.slice(-20).reverse().map(e => {
       const v = verdict(e.hz);
-      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span></div>`;
+      const flag = e.outside ? `<span class="low">⚠ stronger tone at ${e.outside.toFixed(0)} Hz outside search range</span>` : '';
+      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span>${flag}</div>`;
     }).join('');
   }
   function addResult(time, r) {
     lastHz = r.hz;
-    history.push({ time, hz: r.hz, src: r.src, n: r.n });
+    history.push({ time, hz: r.hz, src: r.src, n: r.n, outside: r.outside || null });
     renderLast(); renderHistory();
   }
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = 'status' + (err ? ' err' : ''); }
+  let warnUntil = 0;
+  function showWarn(msg) { const w = $('warn'); w.textContent = '⚠ ' + msg; w.hidden = false; warnUntil = performance.now() + 5000; }
 
   // ---------- Spectrum ----------
   const canvas = $('spec'), c2d = canvas.getContext('2d');
@@ -423,7 +436,11 @@
     const binHz = ctx.sampleRate / anF.fftSize;
     const p = open ? mpm(x, sr, SEARCH_MIN, SEARCH_MAX) : null;
     const fp = open ? fftPeak(freqBuf, binHz, SEARCH_MIN, SEARCH_MAX) : null;
+    const wide = open ? fftPeak(freqBuf, binHz, WIDE_LO, Math.min(WIDE_HI, ctx.sampleRate / 2 - 10)) : null;
     const cand = open ? candidate(p, fp, clarityMin()) : null;
+    const out = open ? outsideTone(wide, fp, SEARCH_MIN, SEARCH_MAX) : null;
+    if (out) showWarn(`Strongest tone is ${out.freq.toFixed(0)} Hz, outside the search range ${SEARCH_MIN}–${SEARCH_MAX} Hz. Widen the range.`);
+    else if (performance.now() > warnUntil) $('warn').hidden = true;
 
     liveHz = cand ? cand.hz : null;
     $('liveHz').textContent = cand ? cand.hz.toFixed(1) : '—';
@@ -434,11 +451,12 @@
     if (open) { heldSpectrum = null; drawSpectrum(freqBuf, binHz, liveHz); } else redrawIdleSpectrum();
 
     const now = performance.now();
-    if (open && !ev) ev = { start: now, pitch: [], fft: [] };
+    if (open && !ev) ev = { start: now, pitch: [], fft: [], outside: [] };
     if (ev && cand) (cand.src === 'pitch' ? ev.pitch : ev.fft).push(cand.hz);
+    if (ev && out) ev.outside.push(out.freq);
     if (ev && (!open || now - ev.start > EVENT_MAX_MS)) {
       const r = summarize(ev);
-      if (r) addResult(new Date().toLocaleTimeString(), r);
+      if (r) { if (ev.outside.length) r.outside = median(ev.outside); addResult(new Date().toLocaleTimeString(), r); }
       ev = null;
     }
   }
@@ -462,14 +480,18 @@
     const finish = (e) => {
       // spectral peak over 0.3 s from the loudest frame, then pitch readings that agree with it
       const seg = removeMean(x.subarray(e.peakS0, Math.min(x.length, e.peakS0 + Math.round(sr * 0.3))));
-      const db = dftSpectrum(seg, sr, Math.ceil(fmax));
+      const wideHi = Math.min(WIDE_HI, Math.floor(sr / 2) - 10);
+      const db = dftSpectrum(seg, sr, Math.max(Math.ceil(fmax), wideHi));
       const fp = fftPeak(db, 1, fmin, fmax);
+      const wide = fftPeak(db, 1, WIDE_LO, wideHi);
+      const out = outsideTone(wide, fp, fmin, fmax);
       const peakOk = fp && fp.prominence >= FFT_PROMINENCE_DB;
       const pitch = peakOk
         ? e.pitch.filter(q => q.clarity >= opts.clarity && Math.abs(q.freq - fp.freq) <= 0.03 * fp.freq)
         : e.pitch.filter(q => q.clarity >= Math.max(opts.clarity, 0.9));
       const r = summarize({ pitch: pitch.map(q => q.freq), fft: peakOk ? [fp.freq] : [] });
-      if (r) events.push({ t: e.t, hz: r.hz, src: r.src, n: r.n, peakLevel: e.peakLevel, db, fp });
+      if (r) events.push({ t: e.t, hz: r.hz, src: r.src, n: r.n, peakLevel: e.peakLevel, db, fp, outside: out ? out.freq : null });
+      else if (out) events.push({ t: e.t, hz: NaN, src: 'none', n: 0, peakLevel: e.peakLevel, db, fp, outside: out.freq });
     };
     for (const f of frames) {
       const open = f.level > opts.gate;
@@ -493,13 +515,23 @@
       setStatus(`Analyzing ${file.name} (${(n / audio.sampleRate).toFixed(1)} s at ${audio.sampleRate} Hz)…`);
       await new Promise(r => setTimeout(r, 30));
       const events = analyzeSamples(mono, audio.sampleRate, { search: searchRange(), gate: gateDb(), clarity: clarityMin() });
+      const valid = events.filter(e => isFinite(e.hz));
+      const outsideEv = events.filter(e => e.outside != null);
       if (!events.length) { setStatus(`No strums found in ${file.name}. Try lowering the gate or the clarity threshold.`, true); return; }
-      for (const e of events) addResult(`file ${e.t.toFixed(2)}s`, e);
+      for (const e of valid) addResult(`file ${e.t.toFixed(2)}s`, e);
       const loudest = events.reduce((a, b) => b.peakLevel > a.peakLevel ? b : a);
-      heldSpectrum = { db: loudest.db, binHz: 1, markHz: loudest.hz };
+      heldSpectrum = { db: loudest.db, binHz: 1, markHz: isFinite(loudest.hz) ? loudest.hz : null };
       redrawIdleSpectrum();
-      const hz = events.map(e => e.hz);
-      setStatus(`${file.name}: ${events.length} strums, median ${median(hz).toFixed(1)} Hz (range ${Math.min(...hz).toFixed(1)}–${Math.max(...hz).toFixed(1)}). Spectrum shows the loudest strum.`);
+      const hz = valid.map(e => e.hz);
+      let msg = valid.length
+        ? `${file.name}: ${valid.length} strums, median ${median(hz).toFixed(1)} Hz (range ${Math.min(...hz).toFixed(1)}–${Math.max(...hz).toFixed(1)}). Spectrum shows the loudest strum.`
+        : `${file.name}: no readable strums inside the search range.`;
+      if (outsideEv.length) {
+        const f = median(outsideEv.map(e => e.outside));
+        showWarn(`${outsideEv.length} of ${events.length} strums have their strongest tone near ${f.toFixed(0)} Hz, outside the search range. Widen the range and re-analyze.`);
+        msg += ` Warning: stronger tone near ${f.toFixed(0)} Hz outside the search range.`;
+      }
+      setStatus(msg, !valid.length);
     } catch (err) {
       setStatus('Could not analyze file: ' + (err.message || err), true);
     } finally { if (ac) ac.close(); }
