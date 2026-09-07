@@ -122,6 +122,7 @@
       <li>You can also pick a voice memo or other recording with Analyze a recording. Each pluck in the file is listed in the history and the loudest one's spectrum is drawn.</li>
       <li>60 Hz mains hum has a harmonic at 120 Hz. If you see a steady 120 Hz with nothing plucked, that is hum, not the belt. Move away from power supplies or fans.</li>
       <li>Presets come from each printer's public docs and are only starting points. Check your own manual, and note that the frequency depends on where you pluck and how long the free span is.</li>
+      <li><b>2:1 ambiguity.</b> When a pluck also shows a peak at exactly half the reading, the tool flags it, because two very different things look identical in audio: the reading is the 2× harmonic of a weaker fundamental (phone capture paths tuned for speech attenuate low notes, so the true belt pitch is the half value), or the belt's other, longer span is ringing at half the pitch (likely when the gantry is 150 mm from the tensioner on a roughly 300 mm axis, and then the reading is right). To settle it: rest a finger on the long span to damp it and pluck the short span again. If the half peak vanishes it was the long span and the reading stands. If it stays, it is the fundamental and the belt's true pitch is the half value. A second test: move the gantry to 100 mm and pluck. A harmonic moves with the reading (both rise 1.5×); a long span barely moves.</li>
       <li>Every pluck lists its prominent peaks. Harmonics of the reading are labeled 2×, 3×. A higher peak that is not a harmonic is called out as "also N Hz": that is a second ringing part (the other belt, a longer span, the frame). If that is the belt, it is tighter than the reading says, so look at the spectrum before tightening further. Tones that were already present before the pluck (hum, fans) are ignored automatically.</li>
       <li>The Mic list shows every audio input the browser can see (names appear after you allow access). Phones have several microphones and the browser may default to the one meant for calls, which is processed for speech. Try each one and keep the one whose plucks stand highest above the noise floor.</li>
       <li>When listening starts, the status line reports the microphone name and whether the browser honored the request for raw audio. Phone browsers often keep automatic gain control or noise suppression on, which lowers and flattens plucks. A dedicated recording app with processing disabled usually gives a cleaner signal; analyze its files with Analyze a recording.</li>
@@ -129,7 +130,7 @@
       <li>The FFT peak reading is a second opinion. If it disagrees by a factor of 2 the detector may be picking an octave; trust the one nearest the strongest spectrum bump.</li>
     </ul>
   </details>
-  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v7 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
+  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v8 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
 </div>
 
 <script>
@@ -143,6 +144,7 @@
   const ALSO_PROM_DB = 18;          // ...and must be at least this prominent (a real belt tone is 20 dB+ above the floor)
   const ALSO_SEP_DB = 8;            // ...and sit in their own peak, this far above the valley toward the reading
   const BG_SETTLE_MS = 800;         // live: how long the gate must be closed before the background spectrum is updated
+  const SUB_TOL = 0.04;             // tolerance for matching a peak to half / 1.5x the reading
   const GATE_ABOVE_FLOOR_DB = 8;    // the gate is never allowed closer than this to the measured noise floor
   const WEAK_DB = 12;               // a pluck peaking less than this above the noise floor is flagged as weak
   const STORE_KEY = 'belt-strum-tuner';
@@ -267,6 +269,20 @@
     const refDb = ref ? ref.db : (peaks[0] ? peaks[0].db : -Infinity);
     return peaks.filter(p => p.rise >= RISE_DB && p.freq > hz * 1.08 && !harmonicOf(p.freq, hz) && p.sep >= ALSO_SEP_DB && p.prominence >= ALSO_PROM_DB && p.db >= refDb - ALSO_DB)
       .slice(0, 2).map(p => p.freq);
+  }
+  // 2:1 ambiguity check. A distinct peak near F/2 means one of two things: the reading F is the 2nd harmonic of a
+  // weaker fundamental (speech-tuned phone capture paths attenuate low fundamentals), or another span of the belt
+  // twice as long is ringing at half the pitch (common with the gantry 150 mm from the tensioner on a ~300 mm axis).
+  // Audio alone cannot separate these, so the tool reports the ambiguity rather than choosing.
+  function fundamentalCheck(widePeaks, F, pitchFrames, lo) {
+    if (!widePeaks || F == null || F / 2 < lo) return null;
+    const near = (f, t) => Math.abs(f / t - 1) <= SUB_TOL;
+    const sub = widePeaks.find(q => near(q.freq, F / 2) && q.rise >= 8 && q.prominence >= 12);
+    if (!sub) return null;
+    const third = widePeaks.find(q => near(q.freq, 1.5 * F) && q.prominence >= 10);
+    const votes = pitchFrames.filter(q => q && q.clarity >= 0.6 && near(q.freq, F / 2)).length;
+    const score = (third ? 1 : 0) + (votes >= 1 ? 1 : 0) + (votes >= 3 ? 1 : 0) + (sub.prominence >= 18 ? 1 : 0);
+    return { f0: sub.freq, third: !!third, votes, score, confident: score >= 2 };
   }
   function describePeaks(peaks, hz) {
     if (!peaks || !peaks.length) return '';
@@ -431,12 +447,13 @@
       const also = e.also && e.also.length ? `<span class="low">⚠ also ${e.also.map(f => f.toFixed(0)).join(', ')} Hz (not a harmonic)</span>` : '';
       const pk = e.peaksText ? `<span style="color:var(--muted)">peaks ${e.peaksText}</span>` : '';
       const wk = e.weak ? `<span class="low">weak</span>` : '';
-      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span>${wk}${pk}${also}${flag}</div>`;
+      const fund = e.possibleF0 ? `<span class="low">⚠ 2:1 ambiguity: peak at ${e.possibleF0.toFixed(0)} Hz (half). Fundamental or long span? See tips.</span>` : '';
+      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span>${wk}${fund}${pk}${also}${flag}</div>`;
     }).join('');
   }
   function addResult(time, r) {
     lastHz = r.hz;
-    history.push({ time, hz: r.hz, src: r.src, n: r.n, outside: r.outside || null, also: r.also || [], peaksText: r.peaksText || '', weak: !!r.weak });
+    history.push({ time, hz: r.hz, src: r.src, n: r.n, outside: r.outside || null, also: r.also || [], peaksText: r.peaksText || '', weak: !!r.weak, harmonicOf: r.harmonicOf || null, possibleF0: r.possibleF0 || null });
     renderLast(); renderHistory();
   }
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = 'status' + (err ? ' err' : ''); }
@@ -535,7 +552,14 @@
     setNeedle('needleLive', liveHz);
     if (open) { heldSpectrum = null; drawSpectrum(freqBuf, binHz, liveHz); } else redrawIdleSpectrum();
 
-    if (open && !ev) ev = { start: now, pitch: [], fft: [], outside: [], bestLevel: -Infinity, bestPeaks: [] };
+    if (open && !ev) ev = { start: now, pitch: [], fft: [], outside: [], bestLevel: -Infinity, bestPeaks: [], pitchFrames: [], subF0: [], subScores: [], nPeak: 0 };
+    if (ev && open && p) ev.pitchFrames.push(p);
+    if (ev && open && fp) {
+      ev.nPeak++;
+      const widePeaks = spectralPeaks(freqBuf, binHz, WIDE_LO, Math.min(WIDE_HI, ctx.sampleRate / 2 - 10), bg);
+      const fc = fundamentalCheck(widePeaks, fp.freq, [p], SEARCH_MIN);
+      if (fc) { ev.subF0.push(fc.f0); ev.subScores.push(fc.score); }
+    }
     if (ev && cand) (cand.src === 'pitch' ? ev.pitch : ev.fft).push(cand.hz);
     if (ev && out) ev.outside.push(out.freq);
     if (ev && open && level > ev.bestLevel) { ev.bestLevel = level; ev.bestPeaks = peaks; }
@@ -544,6 +568,12 @@
       if (r) {
         r.weak = ev.bestLevel < liveFloor + WEAK_DB;
         if (ev.outside.length) r.outside = median(ev.outside);
+        if (ev.subF0.length && ev.subF0.length * 2 >= ev.nPeak) {
+          // evidence over the whole event: pitch votes across frames plus the per-frame third-harmonic/prominence scores
+          const votes = ev.pitchFrames.filter(q => q.clarity >= 0.6 && Math.abs(q.freq / median(ev.subF0) - 1) <= SUB_TOL).length;
+          r.possibleF0 = median(ev.subF0);
+          r.fc = { score: Math.max(...ev.subScores) + (votes >= 1 ? 1 : 0) + (votes >= 3 ? 1 : 0), votes };
+        }
         r.also = alsoPeaks(ev.bestPeaks, r.hz); r.peaksText = describePeaks(ev.bestPeaks, r.hz);
         addResult(new Date().toLocaleTimeString(), r);
       }
@@ -600,10 +630,16 @@
       const pitch = peakOk
         ? e.pitch.filter(q => q.clarity >= opts.clarity && Math.abs(q.freq - fp.freq) <= 0.03 * fp.freq)
         : e.pitch.filter(q => q.clarity >= Math.max(opts.clarity, 0.9));
-      const r = summarize({ pitch: pitch.map(q => q.freq), fft: peakOk ? [fp.freq] : [] });
+      let r = summarize({ pitch: pitch.map(q => q.freq), fft: peakOk ? [fp.freq] : [] });
       const weak = e.peakLevel < floor + WEAK_DB;
+      if (r && peakOk) {
+        const widePeaks = spectralPeaks(db, 1, WIDE_LO, wideHi, bgOff);
+        const fc = fundamentalCheck(widePeaks, fp.freq, e.pitch, fmin);
+        if (fc) { r.possibleF0 = fc.f0; r.fc = fc; }
+      }
       if (r) events.push({ t: e.t, hz: r.hz, src: r.src, n: r.n, peakLevel: e.peakLevel, db, fp, outside: out ? out.freq : null,
-                           also: alsoPeaks(peaks, r.hz), peaksText: describePeaks(peaks, r.hz), peaks, weak });
+                           also: alsoPeaks(peaks, r.hz), peaksText: describePeaks(peaks, r.hz), peaks, weak,
+                           harmonicOf: r.harmonicOf || null, possibleF0: r.possibleF0 || null, fc: r.fc || null });
       else if (out) events.push({ t: e.t, hz: NaN, src: 'none', n: 0, peakLevel: e.peakLevel, db, fp, outside: out.freq, also: [], peaksText: '', peaks, weak });
     };
     for (const f of frames) {
@@ -667,6 +703,8 @@
         ? `${file.name}: ${valid.length} strums, median ${median(hz).toFixed(1)} Hz (range ${Math.min(...hz).toFixed(1)}–${Math.max(...hz).toFixed(1)}). Spectrum shows the loudest strum.`
         : `${file.name}: no readable strums inside the search range.`;
       const weakEv = valid.filter(e => e.weak);
+      const possEv = valid.filter(e => e.possibleF0);
+      if (possEv.length) msg += ` ${possEv.length} strums also show a peak at half the reading (near ${median(possEv.map(e => e.possibleF0)).toFixed(0)} Hz): 2:1 ambiguity, see tips.`;
       const fl = analyzeSamples.lastFloor, eg = analyzeSamples.lastGate;
       msg += ` Noise floor ${fl.toFixed(0)} dB` + (eg > gateDb() + 0.5 ? `, gate raised to ${eg.toFixed(0)} dB for this file.` : '.');
       if (weakEv.length) msg += ` ${weakEv.length} weak strums (less than ${WEAK_DB} dB above the noise): low confidence, get the mic closer or reduce background noise.`;
