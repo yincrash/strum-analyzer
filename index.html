@@ -79,6 +79,7 @@
     <div class="row" style="margin-top:8px">
       <span class="status" id="status">Click Start and allow microphone access.</span>
       <span>Level: <span class="meter"><i id="meter"></i></span></span>
+      <span class="status">Noise floor: <span id="floorVal">—</span></span>
     </div>
   </div>
 
@@ -113,7 +114,7 @@
     <summary>Tips</summary>
     <ul>
       <li>Hold the phone or laptop mic a few cm from the belt and pluck it like a guitar string.</li>
-      <li>If the level meter never turns green, lower the Gate slider. If it is always green from room noise, raise it.</li>
+      <li>If the level meter never turns green, lower the Gate slider. If it is always green from room noise, raise it. The gate is never allowed within 8 dB of the measured noise floor, and a pluck less than 12 dB above the floor is marked weak. Turn off fans and air conditioning while measuring: a pluck should stand 20 dB or more above the room.</li>
       <li>Clarity near 1.0 means a clean tone. Belt plucks often ring for only 100–200 ms, so clarity of 0.6–0.8 is normal. Readings with clarity below the Min clarity slider fall back to the strongest spectral peak.</li>
       <li>You can also pick a voice memo or other recording with Analyze a recording. Each pluck in the file is listed in the history and the loudest one's spectrum is drawn.</li>
       <li>60 Hz mains hum has a harmonic at 120 Hz. If you see a steady 120 Hz with nothing plucked, that is hum, not the belt. Move away from power supplies or fans.</li>
@@ -123,7 +124,7 @@
       <li>The FFT peak reading is a second opinion. If it disagrees by a factor of 2 the detector may be picking an octave; trust the one nearest the strongest spectrum bump.</li>
     </ul>
   </details>
-  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v4 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
+  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v5 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
 </div>
 
 <script>
@@ -137,6 +138,8 @@
   const ALSO_PROM_DB = 18;          // ...and must be at least this prominent (a real belt tone is 20 dB+ above the floor)
   const ALSO_SEP_DB = 8;            // ...and sit in their own peak, this far above the valley toward the reading
   const BG_SETTLE_MS = 800;         // live: how long the gate must be closed before the background spectrum is updated
+  const GATE_ABOVE_FLOOR_DB = 8;    // the gate is never allowed closer than this to the measured noise floor
+  const WEAK_DB = 12;               // a pluck peaking less than this above the noise floor is flagged as weak
   const STORE_KEY = 'belt-strum-tuner';
 
   // Target presets. lo/hi in Hz. Sources are listed in the README.
@@ -157,6 +160,7 @@
   let timeBuf, freqBuf, raf = null;
   let ev = null;           // current strum event {start, pitch:[], fft:[], outside:[], bestLevel, bestPeaks}
   let bg = null, closedSince = null, openSince = null;   // live background spectrum (dB) learned while the gate is closed
+  let liveFloor = null;                                   // running estimate of the quiet level (dB)
   let lastHz = null, liveHz = null;
   const history = [];
 
@@ -421,12 +425,13 @@
       const flag = e.outside ? `<span class="low">⚠ stronger tone at ${e.outside.toFixed(0)} Hz outside search range</span>` : '';
       const also = e.also && e.also.length ? `<span class="low">⚠ also ${e.also.map(f => f.toFixed(0)).join(', ')} Hz (not a harmonic)</span>` : '';
       const pk = e.peaksText ? `<span style="color:var(--muted)">peaks ${e.peaksText}</span>` : '';
-      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span>${pk}${also}${flag}</div>`;
+      const wk = e.weak ? `<span class="low">weak</span>` : '';
+      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span>${wk}${pk}${also}${flag}</div>`;
     }).join('');
   }
   function addResult(time, r) {
     lastHz = r.hz;
-    history.push({ time, hz: r.hz, src: r.src, n: r.n, outside: r.outside || null, also: r.also || [], peaksText: r.peaksText || '' });
+    history.push({ time, hz: r.hz, src: r.src, n: r.n, outside: r.outside || null, also: r.also || [], peaksText: r.peaksText || '', weak: !!r.weak });
     renderLast(); renderHistory();
   }
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = 'status' + (err ? ' err' : ''); }
@@ -480,7 +485,11 @@
     anT.getFloatTimeDomainData(timeBuf);
     anF.getFloatFrequencyData(freqBuf);
     const level = rmsDb(timeBuf);
-    const open = level > gateDb();
+    // noise floor: tracks down quickly, up slowly, so plucks do not pull it up
+    if (liveFloor == null) liveFloor = level; else liveFloor = level < liveFloor ? liveFloor + (level - liveFloor) * 0.2 : liveFloor + 0.01;
+    const gate = Math.max(gateDb(), liveFloor + GATE_ABOVE_FLOOR_DB);
+    const open = level > gate;
+    $('floorVal').textContent = `${liveFloor.toFixed(0)} dB` + (gate > gateDb() + 0.5 ? ` (gate raised to ${gate.toFixed(0)} dB)` : '');
     const meter = $('meter');
     meter.style.width = Math.min(100, Math.max(0, (level + 80) / 80 * 100)) + '%';
     meter.className = open ? 'open' : '';
@@ -528,6 +537,7 @@
     if (ev && (!open || now - ev.start > EVENT_MAX_MS)) {
       const r = summarize(ev);
       if (r) {
+        r.weak = ev.bestLevel < liveFloor + WEAK_DB;
         if (ev.outside.length) r.outside = median(ev.outside);
         r.also = alsoPeaks(ev.bestPeaks, r.hz); r.peaksText = describePeaks(ev.bestPeaks, r.hz);
         addResult(new Date().toLocaleTimeString(), r);
@@ -546,10 +556,14 @@
     const frames = [];
     for (let s0 = 0; s0 + win <= x.length; s0 += hop) {
       const seg = removeMean(x.subarray(s0, s0 + win));
-      const level = rmsDb(seg);
-      const p = level > opts.gate ? mpm(seg, sr, fmin, fmax) : null;
-      frames.push({ t: s0 / sr, s0, level, p });
+      frames.push({ t: s0 / sr, s0, level: rmsDb(seg), p: null, seg });
     }
+    // noise floor = 20th percentile of frame levels; the gate must sit above it
+    const lv = frames.map(f => f.level).sort((a, b) => a - b);
+    const floor = lv.length ? lv[Math.floor(lv.length * 0.2)] : -100;
+    const gate = Math.max(opts.gate, floor + GATE_ABOVE_FLOOR_DB);
+    for (const f of frames) { if (f.level > gate) f.p = mpm(f.seg, sr, fmin, fmax); f.seg = null; }
+    analyzeSamples.lastFloor = floor; analyzeSamples.lastGate = gate;
     const wideHi = Math.min(WIDE_HI, Math.floor(sr / 2) - 10);
     const specHi = Math.max(Math.ceil(fmax), wideHi);
     // global background: spectrum of the quietest 0.3 s in the file
@@ -569,7 +583,7 @@
       const onset = Math.round(e.t * sr), b1 = onset - Math.round(0.05 * sr), b0 = b1 - bgLen;
       // per-bin minimum of the two, so a fading tail of the previous pluck can never raise the background
       let bgOff = bgGlobal;
-      if (b0 >= 0 && rmsDb(x.subarray(b0, b1)) < opts.gate) {
+      if (b0 >= 0 && rmsDb(x.subarray(b0, b1)) < gate) {
         const pre = dftSpectrum(removeMean(x.subarray(b0, b1)), sr, specHi);
         bgOff = bgGlobal ? pre.map((v, i) => Math.min(v, bgGlobal[i])) : pre;
       }
@@ -582,12 +596,13 @@
         ? e.pitch.filter(q => q.clarity >= opts.clarity && Math.abs(q.freq - fp.freq) <= 0.03 * fp.freq)
         : e.pitch.filter(q => q.clarity >= Math.max(opts.clarity, 0.9));
       const r = summarize({ pitch: pitch.map(q => q.freq), fft: peakOk ? [fp.freq] : [] });
+      const weak = e.peakLevel < floor + WEAK_DB;
       if (r) events.push({ t: e.t, hz: r.hz, src: r.src, n: r.n, peakLevel: e.peakLevel, db, fp, outside: out ? out.freq : null,
-                           also: alsoPeaks(peaks, r.hz), peaksText: describePeaks(peaks, r.hz), peaks });
-      else if (out) events.push({ t: e.t, hz: NaN, src: 'none', n: 0, peakLevel: e.peakLevel, db, fp, outside: out.freq, also: [], peaksText: '', peaks });
+                           also: alsoPeaks(peaks, r.hz), peaksText: describePeaks(peaks, r.hz), peaks, weak });
+      else if (out) events.push({ t: e.t, hz: NaN, src: 'none', n: 0, peakLevel: e.peakLevel, db, fp, outside: out.freq, also: [], peaksText: '', peaks, weak });
     };
     for (const f of frames) {
-      const open = f.level > opts.gate;
+      const open = f.level > gate;
       if (open && !e) e = { t: f.t, pitch: [], fft: [], peakLevel: -Infinity, peakS0: f.s0 };
       if (e && open && f.level > e.peakLevel) { e.peakLevel = f.level; e.peakS0 = f.s0; }
       if (e && open && f.p) e.pitch.push(f.p);
@@ -646,6 +661,10 @@
       let msg = valid.length
         ? `${file.name}: ${valid.length} strums, median ${median(hz).toFixed(1)} Hz (range ${Math.min(...hz).toFixed(1)}–${Math.max(...hz).toFixed(1)}). Spectrum shows the loudest strum.`
         : `${file.name}: no readable strums inside the search range.`;
+      const weakEv = valid.filter(e => e.weak);
+      const fl = analyzeSamples.lastFloor, eg = analyzeSamples.lastGate;
+      msg += ` Noise floor ${fl.toFixed(0)} dB` + (eg > gateDb() + 0.5 ? `, gate raised to ${eg.toFixed(0)} dB for this file.` : '.');
+      if (weakEv.length) msg += ` ${weakEv.length} weak strums (less than ${WEAK_DB} dB above the noise): low confidence, get the mic closer or reduce background noise.`;
       const alsoEv = valid.filter(e => e.also && e.also.length);
       if (alsoEv.length) msg += ` Caution: ${alsoEv.length} strums also show a non-harmonic tone (see history).`;
       if (outsideEv.length) {
@@ -688,7 +707,7 @@
     stopTone();
     if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
     if (ctx) ctx.close(); ctx = null;
-    ev = null; bg = null; closedSince = null; openSince = null;
+    ev = null; bg = null; closedSince = null; openSince = null; liveFloor = null;
     stopRecording();
     $('startBtn').textContent = 'Start listening';
     $('toneBtn').disabled = true;

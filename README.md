@@ -56,6 +56,8 @@ Each strum shows its frequency, the verdict, which estimator produced it, and th
 
 Steady tones that were already present before the pluck, such as mains hum or a fan, are learned as background while the input is quiet and ignored. If the input never goes quiet, the page tells you to raise the gate.
 
+The page also measures the noise floor and never lets the gate sit within 8 dB of it. A strum that peaks less than 12 dB above the floor is marked **weak**: its reading is low confidence. A good pluck stands 20 dB or more above the room, which usually means the mic within a few centimeters of the belt and fans or air conditioning off.
+
 Settings are remembered in the browser.
 
 ## How it works
