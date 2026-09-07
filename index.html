@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Belt Strum Tuner</title>
+<style>
+  :root {
+    --bg: #121417; --panel: #1b1f24; --fg: #e8eaed; --muted: #8a919a;
+    --ok: #3fbf6f; --low: #e0a030; --high: #e05050; --accent: #4aa3ff; --border: #2a3038;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  input[type=number] { width: 70px; background: #0e1114; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; font-size: 14px; }
+  input[type=range] { width: 140px; }
+  select { background: #0e1114; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; font-size: 14px; max-width: 100%; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 16px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  button.secondary { background: #2a3038; color: var(--fg); font-weight: 500; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .big { font-size: 64px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -1px; }
+  .big small { font-size: 22px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+  .verdict { font-size: 20px; font-weight: 700; margin-top: 6px; min-height: 26px; }
+  .verdict.ok { color: var(--ok); } .verdict.low { color: var(--low); } .verdict.high { color: var(--high); }
+  .live { color: var(--muted); font-size: 14px; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .live b { color: var(--fg); font-weight: 600; }
+  .gauge { position: relative; height: 34px; margin: 14px 0 4px; background: #0e1114; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+  .gauge .zone { position: absolute; top: 0; bottom: 0; background: rgba(63,191,111,0.30); }
+  .gauge .needle { position: absolute; top: 0; bottom: 0; width: 3px; background: #fff; transform: translateX(-50%); display: none; }
+  .gauge .needle.live { background: var(--accent); opacity: 0.7; }
+  .gauge .tick { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,0.12); }
+  .gauge .tl { position: absolute; bottom: 2px; font-size: 10px; color: var(--muted); transform: translateX(-50%); }
+  canvas { width: 100%; height: 180px; display: block; background: #0e1114; border-radius: 8px; border: 1px solid var(--border); }
+  .hist { font-size: 14px; font-variant-numeric: tabular-nums; }
+  .hist div { display: flex; gap: 14px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+  .hist div:last-child { border-bottom: 0; }
+  .hist .ok { color: var(--ok); } .hist .low { color: var(--low); } .hist .high { color: var(--high); }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.err { color: var(--high); }
+  .meter { display: inline-block; width: 120px; height: 8px; background: #0e1114; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; vertical-align: middle; }
+  .meter i { display: block; height: 100%; width: 0; background: var(--accent); }
+  .meter i.open { background: var(--ok); }
+  details { font-size: 13px; color: var(--muted); }
+  details summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Belt Strum Tuner</h1>
+  <div class="sub">Mercury One.1 spec: strum the belt with the X gantry 150 mm from the tensioner and aim for 110–120 Hz.</div>
+
+  <div class="panel">
+    <div class="row">
+      <button id="startBtn">Start listening</button>
+      <button id="toneBtn" class="secondary" disabled>Play 115 Hz test tone</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <label>Printer <select id="preset"></select></label>
+      <label>Target <input type="number" id="tmin" value="110" step="1"> – <input type="number" id="tmax" value="120" step="1"> Hz</label>
+    </div>
+    <div class="row" style="margin-top:6px"><span class="status" id="presetNote"></span></div>
+    <div class="row" style="margin-top:10px">
+      <label>Search range <input type="number" id="smin" value="40" step="1"> – <input type="number" id="smax" value="400" step="1"> Hz</label>
+      <label>Gate <input type="range" id="gate" min="-80" max="-20" value="-50" step="1"> <span id="gateVal">-50</span> dB</label>
+    </div>
+    <div class="row" style="margin-top:4px"><span class="status">Pitches outside the search range are ignored and the spectrum plot spans it. Narrow it if the detector locks onto a harmonic or room noise.</span></div>
+    <div class="row" style="margin-top:8px">
+      <span class="status" id="status">Click Start and allow microphone access.</span>
+      <span>Level: <span class="meter"><i id="meter"></i></span></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div style="color:var(--muted);font-size:13px">Last strum</div>
+    <div class="big"><span id="lastHz">—</span><small>Hz</small></div>
+    <div class="verdict" id="verdict"></div>
+    <div class="gauge" id="gauge">
+      <div class="zone" id="zone"></div>
+      <div class="needle live" id="needleLive"></div>
+      <div class="needle" id="needleLast"></div>
+    </div>
+    <div class="live">Live: <b id="liveHz">—</b> Hz &nbsp;·&nbsp; note <b id="liveNote">—</b> &nbsp;·&nbsp; clarity <b id="liveClar">—</b> &nbsp;·&nbsp; FFT peak <b id="fftHz">—</b> Hz</div>
+  </div>
+
+  <div class="panel">
+    <div style="color:var(--muted);font-size:13px;margin-bottom:8px">Spectrum over the search range (green band = target)</div>
+    <canvas id="spec"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="justify-content:space-between;margin-bottom:6px">
+      <span style="color:var(--muted);font-size:13px">History (median of each strum)</span>
+      <button class="secondary" id="clearBtn" style="padding:5px 10px;font-size:13px">Clear</button>
+    </div>
+    <div class="hist" id="hist"><div style="color:var(--muted)">No strums yet.</div></div>
+  </div>
+
+  <details class="panel">
+    <summary>Tips</summary>
+    <ul>
+      <li>Hold the phone or laptop mic a few cm from the belt and pluck it like a guitar string.</li>
+      <li>If the level meter never turns green, lower the Gate slider. If it is always green from room noise, raise it.</li>
+      <li>Clarity near 1.0 means a clean tone. Readings below 0.85 clarity are ignored.</li>
+      <li>60 Hz mains hum has a harmonic at 120 Hz. If you see a steady 120 Hz with nothing plucked, that is hum, not the belt. Move away from power supplies or fans.</li>
+      <li>Presets come from each printer's public docs and are only starting points. Check your own manual, and note that the frequency depends on where you pluck and how long the free span is.</li>
+      <li>The FFT peak reading is a second opinion. If it disagrees by a factor of 2 the detector may be picking an octave; trust the one nearest the strongest spectrum bump.</li>
+    </ul>
+  </details>
+</div>
+
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const CLARITY_MIN = 0.85;
+  const EVENT_MAX_MS = 2000;
+  const STORE_KEY = 'belt-strum-tuner';
+
+  // Target presets. lo/hi in Hz. Sources are listed in the README.
+  const PRESETS = [
+    { id: 'custom',        name: 'Custom',                                   lo: null, hi: null, note: 'Enter your own target range.' },
+    { id: 'mercury11',     name: 'ZeroG Mercury One.1 (XY)',                 lo: 110, hi: 120, note: 'ZeroG manual: 110–120 Hz with the X gantry 150 mm from the tensioner.' },
+    { id: 'voron24-ab',    name: 'Voron 2.4 / Trident (A/B belts)',          lo: 105, hi: 115, note: 'Voron docs: about 110 Hz plucked over a 150 mm span (X/Y idler centers 150 mm from the front idlers).' },
+    { id: 'voron24-z',     name: 'Voron 2.4 (Z belts)',                      lo: 135, hi: 145, note: 'Voron docs: about 140 Hz as a starting point.' },
+    { id: 'creality-k1',   name: 'Creality K1 / K1 Max / K1C (XY)',          lo: 105, hi: 115, note: 'Creality wiki: 110 Hz.' },
+    { id: 'ratrig-corexy', name: 'RatRig V-Core 4 (CoreXY belts)',           lo: 86,  hi: 88,  note: 'RatRig wiki: 87 Hz ±1 Hz. A quarter turn of the tensioner screw is roughly 10 Hz.' },
+    { id: 'ratrig-hybrid', name: 'RatRig V-Core 4 Hybrid (hybrid belts)',    lo: 83,  hi: 85,  note: 'RatRig wiki: 84 Hz ±1 Hz.' },
+    { id: 'prusa-coreone', name: 'Prusa CORE One',                           lo: 90,  hi: 98,  note: 'Prusa knowledge base: lower belt at least 90 Hz, upper belt at most 98 Hz.' },
+    { id: 'prusa-coreonel',name: 'Prusa CORE One L',                         lo: 85,  hi: 95,  note: 'Prusa knowledge base: lower belt at least 85 Hz, upper belt at most 95 Hz.' },
+    { id: 'prusa-xl',      name: 'Prusa XL (community value)',               lo: 82,  hi: 85,  note: 'Community-reported 82–85 Hz. Not an official Prusa spec.' },
+  ];
+
+  let ctx = null, stream = null, anT = null, anF = null, osc = null;
+  let timeBuf, freqBuf, raf = null;
+  let ev = null;           // current strum event {start, samples:[]}
+  let lastHz = null, liveHz = null;
+  const history = [];
+
+  // ---------- DSP ----------
+  function decimate2(x) {
+    const n = x.length >> 1, y = new Float32Array(n);
+    let mean = 0;
+    for (let i = 0; i < n; i++) { y[i] = 0.5 * (x[2 * i] + x[2 * i + 1]); mean += y[i]; }
+    mean /= n;
+    for (let i = 0; i < n; i++) y[i] -= mean;
+    return y;
+  }
+
+  // McLeod Pitch Method: normalized square difference function + key-maximum picking.
+  function mpm(x, sr, fmin, fmax) {
+    const n = x.length;
+    const minLag = Math.max(2, Math.floor(sr / fmax));
+    const maxLag = Math.min(n - 2, Math.ceil(sr / fmin));
+    const nsdf = new Float32Array(maxLag + 2);
+    for (let tau = 1; tau <= maxLag + 1; tau++) {
+      let acf = 0, m = 0;
+      for (let i = 0, j = tau; j < n; i++, j++) { const a = x[i], b = x[j]; acf += a * b; m += a * a + b * b; }
+      nsdf[tau] = m > 0 ? 2 * acf / m : 0;
+    }
+    // key maxima between positive- and negative-going zero crossings, after the first negative crossing
+    const maxima = [];
+    let tau = 1;
+    while (tau <= maxLag && nsdf[tau] > 0) tau++;
+    while (tau <= maxLag) {
+      while (tau <= maxLag && nsdf[tau] <= 0) tau++;
+      let best = -1, bestVal = -Infinity;
+      while (tau <= maxLag && nsdf[tau] > 0) { if (nsdf[tau] > bestVal) { bestVal = nsdf[tau]; best = tau; } tau++; }
+      if (best >= minLag && best <= maxLag) maxima.push({ tau: best, val: bestVal });
+    }
+    if (!maxima.length) return null;
+    let globalMax = -Infinity;
+    for (const m of maxima) if (m.val > globalMax) globalMax = m.val;
+    const pick = maxima.find(m => m.val >= 0.9 * globalMax);
+    const t = pick.tau;
+    const a = nsdf[t - 1], b = nsdf[t], c = nsdf[t + 1];
+    const denom = a - 2 * b + c;
+    const shift = denom !== 0 ? 0.5 * (a - c) / denom : 0;
+    const period = t + shift;
+    const clarity = b - 0.25 * (a - c) * shift;
+    return { freq: sr / period, clarity };
+  }
+
+  function fftPeak(db, binHz, fmin, fmax) {
+    const k0 = Math.max(1, Math.floor(fmin / binHz)), k1 = Math.min(db.length - 2, Math.ceil(fmax / binHz));
+    let best = -1, bestVal = -Infinity;
+    for (let k = k0; k <= k1; k++) if (db[k] > bestVal) { bestVal = db[k]; best = k; }
+    if (best < 0) return null;
+    const a = db[best - 1], b = db[best], c = db[best + 1];
+    const denom = a - 2 * b + c;
+    const shift = denom !== 0 ? 0.5 * (a - c) / denom : 0;
+    return { freq: (best + shift) * binHz, db: bestVal };
+  }
+
+  function rmsDb(x) {
+    let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * x[i];
+    return 20 * Math.log10(Math.max(Math.sqrt(s / x.length), 1e-9));
+  }
+
+  const NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  function noteName(f) {
+    const midi = 69 + 12 * Math.log2(f / 440);
+    const r = Math.round(midi), cents = Math.round((midi - r) * 100);
+    return NOTES[((r % 12) + 12) % 12] + (Math.floor(r / 12) - 1) + (cents >= 0 ? '+' : '') + cents + '¢';
+  }
+
+  function median(arr) {
+    const s = arr.slice().sort((a, b) => a - b), m = s.length >> 1;
+    return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
+  }
+
+  // ---------- UI helpers ----------
+  function targets() {
+    let lo = parseFloat($('tmin').value), hi = parseFloat($('tmax').value);
+    if (!(lo < hi)) { lo = 110; hi = 120; }
+    return { lo, hi };
+  }
+  function searchRange() {
+    let lo = parseFloat($('smin').value), hi = parseFloat($('smax').value);
+    if (!(lo >= 20) || !(hi > lo + 10) || hi > 2000) { lo = 40; hi = 400; }
+    return { lo, hi };
+  }
+
+  // ---------- Presets and persistence ----------
+  function buildPresets() {
+    const sel = $('preset');
+    sel.innerHTML = PRESETS.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+  }
+  function applyPreset(id) {
+    const p = PRESETS.find(x => x.id === id) || PRESETS[0];
+    $('preset').value = p.id;
+    if (p.lo != null) { $('tmin').value = p.lo; $('tmax').value = p.hi; }
+    $('presetNote').textContent = p.note;
+  }
+  function markCustomIfChanged() {
+    const p = PRESETS.find(x => x.id === $('preset').value);
+    if (!p || p.lo == null) { $('presetNote').textContent = PRESETS[0].note; $('preset').value = 'custom'; return; }
+    if (parseFloat($('tmin').value) !== p.lo || parseFloat($('tmax').value) !== p.hi) {
+      $('preset').value = 'custom'; $('presetNote').textContent = PRESETS[0].note;
+    }
+  }
+  function saveSettings() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({
+        preset: $('preset').value, tmin: $('tmin').value, tmax: $('tmax').value,
+        smin: $('smin').value, smax: $('smax').value, gate: $('gate').value
+      }));
+    } catch (e) {}
+  }
+  function loadSettings() {
+    let st = null;
+    try { st = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
+    if (!st) { applyPreset('mercury11'); return; }
+    applyPreset(st.preset || 'custom');
+    if (st.tmin != null) $('tmin').value = st.tmin;
+    if (st.tmax != null) $('tmax').value = st.tmax;
+    if (st.smin != null) $('smin').value = st.smin;
+    if (st.smax != null) $('smax').value = st.smax;
+    if (st.gate != null) { $('gate').value = st.gate; $('gateVal').textContent = st.gate; }
+    markCustomIfChanged();
+  }
+  function verdict(f) {
+    const { lo, hi } = targets();
+    if (f < lo) return { text: 'TOO LOOSE: tighten', cls: 'low' };
+    if (f > hi) return { text: 'TOO TIGHT: loosen', cls: 'high' };
+    return { text: 'IN RANGE', cls: 'ok' };
+  }
+  function gaugeRange() { const { lo, hi } = targets(); const pad = Math.max(20, (hi - lo) * 2); return { g0: lo - pad, g1: hi + pad }; }
+  function gaugePct(f) { const { g0, g1 } = gaugeRange(); return Math.min(100, Math.max(0, 100 * (f - g0) / (g1 - g0))); }
+
+  function drawGaugeStatic() {
+    const { lo, hi } = targets(), { g0, g1 } = gaugeRange();
+    const g = $('gauge');
+    g.querySelectorAll('.tick,.tl').forEach(e => e.remove());
+    const zone = $('zone');
+    zone.style.left = gaugePct(lo) + '%'; zone.style.width = (gaugePct(hi) - gaugePct(lo)) + '%';
+    const step = (g1 - g0) > 80 ? 20 : 10;
+    for (let f = Math.ceil(g0 / step) * step; f <= g1; f += step) {
+      const t = document.createElement('div'); t.className = 'tick'; t.style.left = gaugePct(f) + '%'; g.appendChild(t);
+      const l = document.createElement('div'); l.className = 'tl'; l.style.left = gaugePct(f) + '%'; l.textContent = f; g.appendChild(l);
+    }
+  }
+
+  function setNeedle(id, f) {
+    const n = $(id);
+    if (f == null) { n.style.display = 'none'; return; }
+    n.style.display = 'block'; n.style.left = gaugePct(f) + '%';
+  }
+
+  function renderLast() {
+    if (lastHz == null) { $('lastHz').textContent = '—'; $('verdict').textContent = ''; $('verdict').className = 'verdict'; setNeedle('needleLast', null); return; }
+    $('lastHz').textContent = lastHz.toFixed(1);
+    const v = verdict(lastHz);
+    $('verdict').textContent = v.text; $('verdict').className = 'verdict ' + v.cls;
+    setNeedle('needleLast', lastHz);
+  }
+
+  function renderHistory() {
+    const h = $('hist');
+    if (!history.length) { h.innerHTML = '<div style="color:var(--muted)">No strums yet.</div>'; return; }
+    h.innerHTML = history.slice(-12).reverse().map((e, i) => {
+      const v = verdict(e.hz);
+      return `<div><span style="color:var(--muted);width:70px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.n} samples</span></div>`;
+    }).join('');
+  }
+
+  function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = 'status' + (err ? ' err' : ''); }
+
+  // ---------- Spectrum ----------
+  const canvas = $('spec'), c2d = canvas.getContext('2d');
+  function drawSpectrum(db, binHz, markHz) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    if (canvas.width !== W * dpr || canvas.height !== H * dpr) { canvas.width = W * dpr; canvas.height = H * dpr; }
+    c2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c2d.clearRect(0, 0, W, H);
+    const { lo, hi } = targets();
+    const SPEC_MAX_HZ = searchRange().hi;
+    const gridStep = SPEC_MAX_HZ > 800 ? 200 : SPEC_MAX_HZ > 300 ? 50 : 20;
+    const xOf = f => f / SPEC_MAX_HZ * W;
+    c2d.fillStyle = 'rgba(63,191,111,0.18)';
+    c2d.fillRect(xOf(lo), 0, xOf(hi) - xOf(lo), H);
+    // grid
+    c2d.strokeStyle = 'rgba(255,255,255,0.08)'; c2d.fillStyle = '#8a919a'; c2d.font = '10px sans-serif';
+    for (let f = gridStep; f < SPEC_MAX_HZ; f += gridStep) {
+      c2d.beginPath(); c2d.moveTo(xOf(f), 0); c2d.lineTo(xOf(f), H); c2d.stroke();
+      c2d.fillText(f, xOf(f) + 2, H - 4);
+    }
+    if (db) {
+      const kMax = Math.min(db.length - 1, Math.ceil(SPEC_MAX_HZ / binHz));
+      const dbMin = -100, dbMax = -10;
+      c2d.beginPath();
+      for (let k = 0; k <= kMax; k++) {
+        const y = H - (Math.min(dbMax, Math.max(dbMin, db[k])) - dbMin) / (dbMax - dbMin) * H;
+        const x = xOf(k * binHz);
+        k === 0 ? c2d.moveTo(x, y) : c2d.lineTo(x, y);
+      }
+      c2d.strokeStyle = '#4aa3ff'; c2d.lineWidth = 1.5; c2d.stroke();
+    }
+    if (markHz != null && markHz <= SPEC_MAX_HZ) {
+      c2d.strokeStyle = '#fff'; c2d.lineWidth = 1;
+      c2d.beginPath(); c2d.moveTo(xOf(markHz), 0); c2d.lineTo(xOf(markHz), H); c2d.stroke();
+    }
+  }
+
+  // ---------- Main loop ----------
+  function loop() {
+    raf = requestAnimationFrame(loop);
+    anT.getFloatTimeDomainData(timeBuf);
+    anF.getFloatFrequencyData(freqBuf);
+    const level = rmsDb(timeBuf);
+    const gateDb = parseFloat($('gate').value);
+    const open = level > gateDb;
+    const meter = $('meter');
+    meter.style.width = Math.min(100, Math.max(0, (level + 80) / 80 * 100)) + '%';
+    meter.className = open ? 'open' : '';
+
+    const x = decimate2(timeBuf);
+    const sr = ctx.sampleRate / 2;
+    const binHz = ctx.sampleRate / anF.fftSize;
+    const { lo: SEARCH_MIN, hi: SEARCH_MAX } = searchRange();
+    let p = open ? mpm(x, sr, SEARCH_MIN, SEARCH_MAX) : null;
+    const fp = open ? fftPeak(freqBuf, binHz, SEARCH_MIN, SEARCH_MAX) : null;
+    const good = p && p.clarity >= CLARITY_MIN && p.freq >= SEARCH_MIN && p.freq <= SEARCH_MAX;
+
+    liveHz = good ? p.freq : null;
+    $('liveHz').textContent = good ? p.freq.toFixed(1) : '—';
+    $('liveNote').textContent = good ? noteName(p.freq) : '—';
+    $('liveClar').textContent = p ? p.clarity.toFixed(2) : '—';
+    $('fftHz').textContent = fp ? fp.freq.toFixed(1) : '—';
+    setNeedle('needleLive', liveHz);
+    drawSpectrum(open ? freqBuf : null, binHz, liveHz);
+
+    // strum event tracking
+    const now = performance.now();
+    if (open && !ev) ev = { start: now, samples: [] };
+    if (ev && good) ev.samples.push(p.freq);
+    if (ev && (!open || now - ev.start > EVENT_MAX_MS)) {
+      if (ev.samples.length >= 3) {
+        lastHz = median(ev.samples);
+        history.push({ time: new Date().toLocaleTimeString(), hz: lastHz, n: ev.samples.length });
+        renderLast(); renderHistory();
+      }
+      ev = null;
+    }
+  }
+
+  // ---------- Start / stop ----------
+  async function start() {
+    try {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      await ctx.resume();
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+      const src = ctx.createMediaStreamSource(stream);
+      anT = ctx.createAnalyser(); anT.fftSize = 8192; anT.smoothingTimeConstant = 0;
+      anF = ctx.createAnalyser(); anF.fftSize = 32768; anF.smoothingTimeConstant = 0.5;
+      src.connect(anT); src.connect(anF);
+      timeBuf = new Float32Array(anT.fftSize);
+      freqBuf = new Float32Array(anF.frequencyBinCount);
+      setStatus(`Listening at ${ctx.sampleRate} Hz. Pluck the belt.`);
+      $('startBtn').textContent = 'Stop';
+      $('toneBtn').disabled = false;
+      loop();
+    } catch (e) {
+      setStatus('Microphone error: ' + (e.message || e), true);
+      stop();
+    }
+  }
+  function stop() {
+    if (raf) cancelAnimationFrame(raf); raf = null;
+    stopTone();
+    if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+    if (ctx) ctx.close(); ctx = null;
+    ev = null;
+    $('startBtn').textContent = 'Start listening';
+    $('toneBtn').disabled = true;
+    $('meter').style.width = '0';
+    setNeedle('needleLive', null);
+    drawSpectrum(null, 1, null);
+  }
+  function stopTone() {
+    if (osc) { osc.stop(); osc.disconnect(); osc = null; $('toneBtn').textContent = 'Play 115 Hz test tone'; }
+  }
+  function toggleTone() {
+    if (!ctx) return;
+    if (osc) { stopTone(); return; }
+    osc = ctx.createOscillator(); osc.frequency.value = 115; osc.type = 'sine';
+    const g = ctx.createGain(); g.gain.value = 0.4;
+    osc.connect(g); g.connect(ctx.destination); osc.start();
+    $('toneBtn').textContent = 'Stop test tone';
+  }
+
+  $('startBtn').addEventListener('click', () => ctx ? stop() : start());
+  $('toneBtn').addEventListener('click', toggleTone);
+  $('clearBtn').addEventListener('click', () => { history.length = 0; lastHz = null; renderLast(); renderHistory(); });
+  $('gate').addEventListener('input', () => { $('gateVal').textContent = $('gate').value; saveSettings(); });
+  $('preset').addEventListener('change', () => { applyPreset($('preset').value); drawGaugeStatic(); renderLast(); renderHistory(); saveSettings(); });
+  ['tmin', 'tmax'].forEach(id => $(id).addEventListener('change', () => { markCustomIfChanged(); drawGaugeStatic(); renderLast(); renderHistory(); saveSettings(); }));
+  ['smin', 'smax'].forEach(id => $(id).addEventListener('change', () => { drawSpectrum(null, 1, null); saveSettings(); }));
+  window.addEventListener('resize', () => drawSpectrum(null, 1, null));
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('This browser does not expose the microphone here. Serve the page over http://localhost or https.', true);
+    $('startBtn').disabled = true;
+  }
+  buildPresets(); loadSettings();
+  drawGaugeStatic(); renderLast(); drawSpectrum(null, 1, null);
+})();
+</script>
+</body>
+</html>
