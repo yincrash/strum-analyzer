@@ -59,6 +59,7 @@
     <div class="row">
       <button id="startBtn">Start listening</button>
       <button id="toneBtn" class="secondary" disabled>Play 115 Hz test tone</button>
+      <button id="recBtn" class="secondary" disabled>Record 10 s &amp; analyze</button>
     </div>
     <div class="row" style="margin-top:10px">
       <label>Printer <select id="preset"></select></label>
@@ -72,6 +73,7 @@
     </div>
     <div class="row" style="margin-top:10px">
       <label>Analyze a recording <input type="file" id="fileIn" accept="audio/*,.m4a,.wav,.mp3,.ogg,.aac,.caf"></label>
+      <a id="saveRec" hidden style="font-size:13px;color:var(--accent)"></a>
     </div>
     <div class="row" style="margin-top:4px"><span class="status">Pitches outside the search range are ignored and the spectrum plot spans it. Narrow it if the detector locks onto a harmonic or room noise. Min clarity sets how clean a tone must be for the pitch detector; The reading is the strongest spectral peak standing 12 dB above the background, refined by the pitch detector when the two agree.</span></div>
     <div class="row" style="margin-top:8px">
@@ -91,6 +93,7 @@
     </div>
     <div class="status err" id="warn" hidden style="margin-top:8px;font-weight:600"></div>
     <div class="live">Live: <b id="liveHz">—</b> Hz &nbsp;·&nbsp; note <b id="liveNote">—</b> &nbsp;·&nbsp; clarity <b id="liveClar">—</b> &nbsp;·&nbsp; FFT peak <b id="fftHz">—</b> Hz</div>
+    <div class="live">Peaks in this pluck: <b id="livePeaks">—</b> Hz</div>
   </div>
 
   <div class="panel">
@@ -115,10 +118,12 @@
       <li>You can also pick a voice memo or other recording with Analyze a recording. Each pluck in the file is listed in the history and the loudest one's spectrum is drawn.</li>
       <li>60 Hz mains hum has a harmonic at 120 Hz. If you see a steady 120 Hz with nothing plucked, that is hum, not the belt. Move away from power supplies or fans.</li>
       <li>Presets come from each printer's public docs and are only starting points. Check your own manual, and note that the frequency depends on where you pluck and how long the free span is.</li>
+      <li>Every pluck lists its prominent peaks. Harmonics of the reading are labeled 2×, 3×. A higher peak that is not a harmonic is called out as "also N Hz": that is a second ringing part (the other belt, a longer span, the frame). If that is the belt, it is tighter than the reading says, so look at the spectrum before tightening further. Tones that were already present before the pluck (hum, fans) are ignored automatically.</li>
+      <li>Record 10 s &amp; analyze captures the page's own microphone input and runs it through the same analysis used for files, and offers the recording to save. Use it to compare against a recording app: pluck while both are running and feed the app's file to Analyze a recording.</li>
       <li>The FFT peak reading is a second opinion. If it disagrees by a factor of 2 the detector may be picking an octave; trust the one nearest the strongest spectrum bump.</li>
     </ul>
   </details>
-  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v3 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
+  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v4 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
 </div>
 
 <script>
@@ -127,6 +132,11 @@
   const EVENT_MAX_MS = 2000;
   const FFT_PROMINENCE_DB = 12;     // FFT peak must stand this far above the median level in the search range
   const WIDE_LO = 20, WIDE_HI = 1200; // Hz, range scanned for a stronger tone outside the user's search range
+  const RISE_DB = 10;               // a peak must rise this far above the pre-pluck background to count as part of the pluck
+  const ALSO_DB = 15;               // non-harmonic peaks within this many dB of the reading are reported as "also"
+  const ALSO_PROM_DB = 18;          // ...and must be at least this prominent (a real belt tone is 20 dB+ above the floor)
+  const ALSO_SEP_DB = 8;            // ...and sit in their own peak, this far above the valley toward the reading
+  const BG_SETTLE_MS = 800;         // live: how long the gate must be closed before the background spectrum is updated
   const STORE_KEY = 'belt-strum-tuner';
 
   // Target presets. lo/hi in Hz. Sources are listed in the README.
@@ -145,7 +155,8 @@
 
   let ctx = null, stream = null, anT = null, anF = null, osc = null;
   let timeBuf, freqBuf, raf = null;
-  let ev = null;           // current strum event {start, pitch:[], fft:[]}
+  let ev = null;           // current strum event {start, pitch:[], fft:[], outside:[], bestLevel, bestPeaks}
+  let bg = null, closedSince = null, openSince = null;   // live background spectrum (dB) learned while the gate is closed
   let lastHz = null, liveHz = null;
   const history = [];
 
@@ -200,18 +211,60 @@
     return { freq: sr / period, clarity };
   }
 
-  // Strongest spectral peak in [fmin,fmax] with parabolic interpolation and prominence above the median level.
-  function fftPeak(db, binHz, fmin, fmax) {
+  // All prominent spectral peaks in [fmin,fmax]: local maxima at least FFT_PROMINENCE_DB above the median level,
+  // parabolic-interpolated, strongest first. `rise` is how far the peak stands above the background spectrum `bg`
+  // (a steady tone that was already there before the pluck has a small rise).
+  function spectralPeaks(db, binHz, fmin, fmax, bg) {
     const k0 = Math.max(1, Math.floor(fmin / binHz)), k1 = Math.min(db.length - 2, Math.ceil(fmax / binHz));
-    if (k1 <= k0) return null;
-    let best = -1, bestVal = -Infinity;
-    for (let k = k0; k <= k1; k++) if (db[k] > bestVal) { bestVal = db[k]; best = k; }
-    if (best < 0 || !isFinite(bestVal)) return null;
-    const a = db[best - 1], b = db[best], c = db[best + 1];
-    const denom = a - 2 * b + c;
-    const shift = denom !== 0 ? 0.5 * (a - c) / denom : 0;
+    if (k1 <= k0) return [];
     const med = median(Array.from(db.subarray(k0, k1 + 1)).filter(isFinite));
-    return { freq: (best + shift) * binHz, db: bestVal, prominence: bestVal - med };
+    const out = [];
+    for (let k = k0; k <= k1; k++) {
+      const b = db[k];
+      if (!isFinite(b) || !(b > db[k - 1] && b >= db[k + 1]) || b - med < FFT_PROMINENCE_DB) continue;
+      const a = db[k - 1], c = db[k + 1], denom = a - 2 * b + c, shift = denom !== 0 ? 0.5 * (a - c) / denom : 0;
+      let rise = Infinity;
+      if (bg) { let m = -Infinity; for (let j = Math.max(0, k - 2); j <= Math.min(bg.length - 1, k + 2); j++) if (isFinite(bg[j]) && bg[j] > m) m = bg[j]; if (isFinite(m)) rise = b - m; }
+      out.push({ k, freq: (k + shift) * binHz, db: b - 0.25 * (a - c) * shift, prominence: b - med, rise, sep: Infinity });
+    }
+    out.sort((p, q) => q.db - p.db);
+    const kept = [];
+    for (const p of out) if (!kept.some(q => Math.abs(q.freq - p.freq) < Math.max(4, 0.08 * q.freq))) kept.push(p);
+    // sep: how far each peak stands above the deepest valley between it and the strongest peak
+    if (kept.length > 1) {
+      const top = kept[0];
+      for (const p of kept.slice(1)) {
+        let v = Infinity; const lo = Math.min(p.k, top.k), hi = Math.max(p.k, top.k);
+        for (let j = lo; j <= hi; j++) if (isFinite(db[j]) && db[j] < v) v = db[j];
+        p.sep = p.db - v;
+      }
+    }
+    return kept.slice(0, 8);
+  }
+  // The reading candidate: strongest peak that actually rose with the pluck.
+  function pickPeak(peaks) { return peaks.find(p => p.rise >= RISE_DB) || null; }
+  function fftPeak(db, binHz, fmin, fmax, bg) { return pickPeak(spectralPeaks(db, binHz, fmin, fmax, bg)); }
+  // Harmonic label for a peak relative to the reading f0: '2×', '3×'... or null if not a harmonic.
+  function harmonicOf(f, f0) {
+    for (let n = 2; n <= 8; n++) if (Math.abs(f / (n * f0) - 1) < 0.04) return n + '×';
+    return null;
+  }
+  // Cautions: tones ABOVE the reading that are not its harmonics, rose with the pluck, sit in their own peak
+  // (a real valley between them and the reading) and are within ALSO_DB of it. If one of these is the belt,
+  // the belt is tighter than the reading says.
+  function alsoPeaks(peaks, hz) {
+    if (!peaks || hz == null) return [];
+    const ref = peaks.find(p => Math.abs(p.freq - hz) < Math.max(3, 0.03 * hz));
+    const refDb = ref ? ref.db : (peaks[0] ? peaks[0].db : -Infinity);
+    return peaks.filter(p => p.rise >= RISE_DB && p.freq > hz * 1.08 && !harmonicOf(p.freq, hz) && p.sep >= ALSO_SEP_DB && p.prominence >= ALSO_PROM_DB && p.db >= refDb - ALSO_DB)
+      .slice(0, 2).map(p => p.freq);
+  }
+  function describePeaks(peaks, hz) {
+    if (!peaks || !peaks.length) return '';
+    return peaks.filter(p => p.rise >= RISE_DB).slice(0, 5).sort((a, b) => a.freq - b.freq).map(p => {
+      const h = hz != null && Math.abs(p.freq - hz) >= Math.max(3, 0.03 * hz) ? harmonicOf(p.freq, hz) : null;
+      return p.freq.toFixed(0) + (h ? ' (' + h + ')' : '');
+    }).join(' · ');
   }
 
   // Direct DFT in dB at 1 Hz steps (Hann window). Used for recordings, where there is no AnalyserNode.
@@ -250,7 +303,7 @@
   // the pitch detector refines it when the two agree, and stands alone only for a very clean tone.
   // (Belt plucks are short and noisy; on real recordings the pitch detector alone often picks a subharmonic.)
   function candidate(p, fp, clarityMin) {
-    const peakOk = fp && fp.prominence >= FFT_PROMINENCE_DB;
+    const peakOk = !!fp;
     const pitchOk = p && p.clarity >= clarityMin;
     if (peakOk && pitchOk && Math.abs(p.freq - fp.freq) <= 0.03 * fp.freq) return { hz: p.freq, src: 'pitch' };
     if (peakOk) return { hz: fp.freq, src: 'peak' };
@@ -259,7 +312,7 @@
   }
   // A prominent tone outside the search range that beats the in-range peak by a clear margin.
   function outsideTone(wide, fp, lo, hi) {
-    if (!wide || wide.prominence < FFT_PROMINENCE_DB) return null;
+    if (!wide) return null;
     if (wide.freq >= lo && wide.freq <= hi) return null;
     if (fp && fp.db >= wide.db - 6) return null;
     return wide;
@@ -366,12 +419,14 @@
     h.innerHTML = history.slice(-20).reverse().map(e => {
       const v = verdict(e.hz);
       const flag = e.outside ? `<span class="low">⚠ stronger tone at ${e.outside.toFixed(0)} Hz outside search range</span>` : '';
-      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span>${flag}</div>`;
+      const also = e.also && e.also.length ? `<span class="low">⚠ also ${e.also.map(f => f.toFixed(0)).join(', ')} Hz (not a harmonic)</span>` : '';
+      const pk = e.peaksText ? `<span style="color:var(--muted)">peaks ${e.peaksText}</span>` : '';
+      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span>${pk}${also}${flag}</div>`;
     }).join('');
   }
   function addResult(time, r) {
     lastHz = r.hz;
-    history.push({ time, hz: r.hz, src: r.src, n: r.n, outside: r.outside || null });
+    history.push({ time, hz: r.hz, src: r.src, n: r.n, outside: r.outside || null, also: r.also || [], peaksText: r.peaksText || '' });
     renderLast(); renderHistory();
   }
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = 'status' + (err ? ' err' : ''); }
@@ -434,13 +489,29 @@
     const x = decimate2(timeBuf);
     const sr = ctx.sampleRate / 2;
     const binHz = ctx.sampleRate / anF.fftSize;
+    const now = performance.now();
+    // learn the background spectrum once the input has been quiet for a while
+    if (!open) {
+      openSince = null;
+      if (closedSince == null) closedSince = now;
+      else if (now - closedSince > BG_SETTLE_MS) {
+        if (!bg) bg = Float32Array.from(freqBuf);
+        else for (let k = 0; k < bg.length; k++) if (isFinite(freqBuf[k])) bg[k] = Math.min(freqBuf[k], 0.9 * bg[k] + 0.1 * freqBuf[k]) + 0.02; // tracks down fast, up slowly
+      }
+    } else {
+      closedSince = null;
+      if (openSince == null) openSince = now;
+      else if (now - openSince > 3000) showWarn(`Input has been above the gate for ${((now - openSince) / 1000).toFixed(0)} s. Raise the Gate slider until the level bar only turns green when you pluck.`);
+    }
     const p = open ? mpm(x, sr, SEARCH_MIN, SEARCH_MAX) : null;
-    const fp = open ? fftPeak(freqBuf, binHz, SEARCH_MIN, SEARCH_MAX) : null;
-    const wide = open ? fftPeak(freqBuf, binHz, WIDE_LO, Math.min(WIDE_HI, ctx.sampleRate / 2 - 10)) : null;
+    const peaks = open ? spectralPeaks(freqBuf, binHz, SEARCH_MIN, SEARCH_MAX, bg) : [];
+    const fp = pickPeak(peaks);
+    const wide = open ? fftPeak(freqBuf, binHz, WIDE_LO, Math.min(WIDE_HI, ctx.sampleRate / 2 - 10), bg) : null;
     const cand = open ? candidate(p, fp, clarityMin()) : null;
     const out = open ? outsideTone(wide, fp, SEARCH_MIN, SEARCH_MAX) : null;
     if (out) showWarn(`Strongest tone is ${out.freq.toFixed(0)} Hz, outside the search range ${SEARCH_MIN}–${SEARCH_MAX} Hz. Widen the range.`);
-    else if (performance.now() > warnUntil) $('warn').hidden = true;
+    else if (now > warnUntil) $('warn').hidden = true;
+    $('livePeaks').textContent = open ? (describePeaks(peaks, cand ? cand.hz : null) || '—') : '—';
 
     liveHz = cand ? cand.hz : null;
     $('liveHz').textContent = cand ? cand.hz.toFixed(1) : '—';
@@ -450,20 +521,24 @@
     setNeedle('needleLive', liveHz);
     if (open) { heldSpectrum = null; drawSpectrum(freqBuf, binHz, liveHz); } else redrawIdleSpectrum();
 
-    const now = performance.now();
-    if (open && !ev) ev = { start: now, pitch: [], fft: [], outside: [] };
+    if (open && !ev) ev = { start: now, pitch: [], fft: [], outside: [], bestLevel: -Infinity, bestPeaks: [] };
     if (ev && cand) (cand.src === 'pitch' ? ev.pitch : ev.fft).push(cand.hz);
     if (ev && out) ev.outside.push(out.freq);
+    if (ev && open && level > ev.bestLevel) { ev.bestLevel = level; ev.bestPeaks = peaks; }
     if (ev && (!open || now - ev.start > EVENT_MAX_MS)) {
       const r = summarize(ev);
-      if (r) { if (ev.outside.length) r.outside = median(ev.outside); addResult(new Date().toLocaleTimeString(), r); }
+      if (r) {
+        if (ev.outside.length) r.outside = median(ev.outside);
+        r.also = alsoPeaks(ev.bestPeaks, r.hz); r.peaksText = describePeaks(ev.bestPeaks, r.hz);
+        addResult(new Date().toLocaleTimeString(), r);
+      }
       ev = null;
     }
   }
 
   // ---------- Recording analysis (same pipeline, offline) ----------
   function analyzeSamples(x0, sr0, opts) {
-    // x0: mono Float32Array at sr0. Returns { events:[{t, hz, src, n, peakLevel}], spectrum:{db, binHz, markHz} }
+    // x0: mono Float32Array at sr0. Returns events [{t, hz, src, n, peakLevel, db, peaks, also, outside}]
     let x = x0, sr = sr0;
     if (sr0 > 30000) { x = decimate2(x0); sr = sr0 / 2; }
     const win = Math.round(sr * 0.085), hop = Math.round(sr * 0.02);
@@ -475,23 +550,41 @@
       const p = level > opts.gate ? mpm(seg, sr, fmin, fmax) : null;
       frames.push({ t: s0 / sr, s0, level, p });
     }
+    const wideHi = Math.min(WIDE_HI, Math.floor(sr / 2) - 10);
+    const specHi = Math.max(Math.ceil(fmax), wideHi);
+    // global background: spectrum of the quietest 0.3 s in the file
+    const bgLen = Math.round(sr * 0.3);
+    let quietS0 = 0, quietLvl = Infinity;
+    for (let s0 = 0; s0 + bgLen <= x.length; s0 += Math.round(sr * 0.05)) {
+      const l = rmsDb(x.subarray(s0, s0 + bgLen)); if (l < quietLvl) { quietLvl = l; quietS0 = s0; }
+    }
+    const bgGlobal = x.length >= bgLen ? dftSpectrum(removeMean(x.subarray(quietS0, quietS0 + bgLen)), sr, specHi) : null;
     const events = [];
     let e = null;
     const finish = (e) => {
       // spectral peak over 0.3 s from the loudest frame, then pitch readings that agree with it
       const seg = removeMean(x.subarray(e.peakS0, Math.min(x.length, e.peakS0 + Math.round(sr * 0.3))));
-      const wideHi = Math.min(WIDE_HI, Math.floor(sr / 2) - 10);
-      const db = dftSpectrum(seg, sr, Math.max(Math.ceil(fmax), wideHi));
-      const fp = fftPeak(db, 1, fmin, fmax);
-      const wide = fftPeak(db, 1, WIDE_LO, wideHi);
+      const db = dftSpectrum(seg, sr, specHi);
+      // background: the 0.3 s before the onset if it is quiet, otherwise the quietest part of the file
+      const onset = Math.round(e.t * sr), b1 = onset - Math.round(0.05 * sr), b0 = b1 - bgLen;
+      // per-bin minimum of the two, so a fading tail of the previous pluck can never raise the background
+      let bgOff = bgGlobal;
+      if (b0 >= 0 && rmsDb(x.subarray(b0, b1)) < opts.gate) {
+        const pre = dftSpectrum(removeMean(x.subarray(b0, b1)), sr, specHi);
+        bgOff = bgGlobal ? pre.map((v, i) => Math.min(v, bgGlobal[i])) : pre;
+      }
+      const peaks = spectralPeaks(db, 1, fmin, fmax, bgOff);
+      const fp = pickPeak(peaks);
+      const wide = fftPeak(db, 1, WIDE_LO, wideHi, bgOff);
       const out = outsideTone(wide, fp, fmin, fmax);
-      const peakOk = fp && fp.prominence >= FFT_PROMINENCE_DB;
+      const peakOk = !!fp;
       const pitch = peakOk
         ? e.pitch.filter(q => q.clarity >= opts.clarity && Math.abs(q.freq - fp.freq) <= 0.03 * fp.freq)
         : e.pitch.filter(q => q.clarity >= Math.max(opts.clarity, 0.9));
       const r = summarize({ pitch: pitch.map(q => q.freq), fft: peakOk ? [fp.freq] : [] });
-      if (r) events.push({ t: e.t, hz: r.hz, src: r.src, n: r.n, peakLevel: e.peakLevel, db, fp, outside: out ? out.freq : null });
-      else if (out) events.push({ t: e.t, hz: NaN, src: 'none', n: 0, peakLevel: e.peakLevel, db, fp, outside: out.freq });
+      if (r) events.push({ t: e.t, hz: r.hz, src: r.src, n: r.n, peakLevel: e.peakLevel, db, fp, outside: out ? out.freq : null,
+                           also: alsoPeaks(peaks, r.hz), peaksText: describePeaks(peaks, r.hz), peaks });
+      else if (out) events.push({ t: e.t, hz: NaN, src: 'none', n: 0, peakLevel: e.peakLevel, db, fp, outside: out.freq, also: [], peaksText: '', peaks });
     };
     for (const f of frames) {
       const open = f.level > opts.gate;
@@ -502,6 +595,33 @@
     }
     if (e) finish(e);
     return events;
+  }
+
+  // Record the page's own mic input and run it through the file pipeline, so the live and file paths can be compared.
+  let recorder = null, recChunks = [], recTimer = null, recUrl = null;
+  function startRecording() {
+    if (!stream || typeof MediaRecorder === 'undefined') { setStatus('Recording needs an active microphone and a browser with MediaRecorder.', true); return; }
+    recChunks = [];
+    try { recorder = new MediaRecorder(stream); } catch (e) { setStatus('Cannot record: ' + e.message, true); return; }
+    recorder.ondataavailable = ev => { if (ev.data.size) recChunks.push(ev.data); };
+    recorder.onstop = () => {
+      const blob = new Blob(recChunks, { type: recorder.mimeType || 'audio/webm' });
+      const ext = (recorder.mimeType || 'audio/webm').includes('mp4') ? 'm4a' : (recorder.mimeType || '').includes('ogg') ? 'ogg' : 'webm';
+      const name = 'strum-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.' + ext;
+      if (recUrl) URL.revokeObjectURL(recUrl);
+      recUrl = URL.createObjectURL(blob);
+      const a = $('saveRec'); a.href = recUrl; a.download = name; a.textContent = 'Save ' + name; a.hidden = false;
+      analyzeFile(new File([blob], name, { type: blob.type }));
+      recorder = null; $('recBtn').textContent = 'Record 10 s & analyze';
+    };
+    recorder.start();
+    $('recBtn').textContent = 'Stop recording';
+    setStatus('Recording… pluck the belt. Stops automatically after 10 s.');
+    recTimer = setTimeout(stopRecording, 10000);
+  }
+  function stopRecording() {
+    if (recTimer) { clearTimeout(recTimer); recTimer = null; }
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
   }
 
   async function analyzeFile(file) {
@@ -526,6 +646,8 @@
       let msg = valid.length
         ? `${file.name}: ${valid.length} strums, median ${median(hz).toFixed(1)} Hz (range ${Math.min(...hz).toFixed(1)}–${Math.max(...hz).toFixed(1)}). Spectrum shows the loudest strum.`
         : `${file.name}: no readable strums inside the search range.`;
+      const alsoEv = valid.filter(e => e.also && e.also.length);
+      if (alsoEv.length) msg += ` Caution: ${alsoEv.length} strums also show a non-harmonic tone (see history).`;
       if (outsideEv.length) {
         const f = median(outsideEv.map(e => e.outside));
         showWarn(`${outsideEv.length} of ${events.length} strums have their strongest tone near ${f.toFixed(0)} Hz, outside the search range. Widen the range and re-analyze.`);
@@ -554,6 +676,7 @@
       setStatus(`Listening at ${ctx.sampleRate} Hz. Pluck the belt.`);
       $('startBtn').textContent = 'Stop';
       $('toneBtn').disabled = false;
+      $('recBtn').disabled = false;
       loop();
     } catch (e) {
       setStatus('Microphone error: ' + (e.message || e), true);
@@ -565,9 +688,11 @@
     stopTone();
     if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
     if (ctx) ctx.close(); ctx = null;
-    ev = null;
+    ev = null; bg = null; closedSince = null; openSince = null;
+    stopRecording();
     $('startBtn').textContent = 'Start listening';
     $('toneBtn').disabled = true;
+    $('recBtn').disabled = true;
     $('meter').style.width = '0';
     setNeedle('needleLive', null);
     redrawIdleSpectrum();
@@ -586,6 +711,7 @@
 
   $('startBtn').addEventListener('click', () => ctx ? stop() : start());
   $('toneBtn').addEventListener('click', toggleTone);
+  $('recBtn').addEventListener('click', () => recorder ? stopRecording() : startRecording());
   $('clearBtn').addEventListener('click', () => { history.length = 0; lastHz = null; heldSpectrum = null; renderLast(); renderHistory(); redrawIdleSpectrum(); });
   $('gate').addEventListener('input', () => { $('gateVal').textContent = $('gate').value; saveSettings(); });
   $('clarity').addEventListener('input', () => { $('clarityVal').textContent = parseFloat($('clarity').value).toFixed(2); saveSettings(); });
@@ -603,7 +729,7 @@
   drawGaugeStatic(); renderLast(); redrawIdleSpectrum();
 
   // exposed for tests
-  window.BeltTuner = { mpm, fftPeak, dftSpectrum, decimate2, analyzeSamples, median };
+  window.BeltTuner = { mpm, fftPeak, spectralPeaks, dftSpectrum, decimate2, analyzeSamples, median };
 })();
 </script>
 </body>

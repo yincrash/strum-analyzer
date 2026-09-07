@@ -14,7 +14,7 @@ Everything runs in the browser. No audio leaves your device.
 4. Read the **Last strum** number. It is the median of the readings taken while the belt was ringing. The verdict tells you whether to tighten or loosen.
 5. Adjust, pluck again, and compare against the history list.
 
-You can also analyze an existing recording, such as a phone voice memo, with **Analyze a recording**. Every pluck found in the file is added to the history and the loudest one's spectrum is drawn.
+You can also analyze an existing recording, such as a phone voice memo, with **Analyze a recording**. Every pluck found in the file is added to the history and the loudest one's spectrum is drawn. **Record 10 s & analyze** captures the page's own microphone input, runs it through the same file analysis, and offers the recording to save, which is handy for comparing against a recording app or for sharing.
 
 ## Presets
 
@@ -47,13 +47,22 @@ Sources:
 - **Min clarity**: how clean a tone the pitch detector needs before its value is used to refine the spectral peak. Belt plucks ring for only 100–200 ms, so 0.6 is a reasonable default.
 - **Test tone**: plays 115 Hz through the speakers so you can confirm the mic and detector agree.
 
+## Reading the history
+
+Each strum shows its frequency, the verdict, which estimator produced it, and the prominent peaks in that pluck with harmonics of the reading labeled (2×, 3×). Two cautions can appear:
+
+- **also N Hz (not a harmonic)**: a second tone above the reading that rang with the pluck and is not one of its harmonics. That is another ringing part, such as the other belt, a longer span, or the frame. If that tone is actually the belt, the belt is tighter than the reading says, so check the spectrum before tightening further.
+- **stronger tone at N Hz outside search range**: the loudest tone in 20–1200 Hz lies outside the search range you set. A search range capped below the belt's frequency makes the tool report half the true value, so widen the range.
+
+Steady tones that were already present before the pluck, such as mains hum or a fan, are learned as background while the input is quiet and ignored. If the input never goes quiet, the page tells you to raise the gate.
+
 Settings are remembered in the browser.
 
 ## How it works
 
 Two estimators run on every frame while the input is above the gate:
 
-- **Spectral peak**: the strongest peak in the search range of a 32768-point FFT, parabolic-interpolated, and only accepted when it stands at least 12 dB above the median level in the range. This is the primary reading and matches how the printer communities measure belts with spectrum-analyzer apps.
+- **Spectral peak**: the strongest peak in the search range of a 32768-point FFT, parabolic-interpolated, accepted only when it stands at least 12 dB above the median level in the range and at least 10 dB above the background spectrum learned while the input was quiet. This is the primary reading and matches how the printer communities measure belts with spectrum-analyzer apps.
 - **Pitch detector**: the McLeod Pitch Method (normalized square difference, key-maximum picking, parabolic interpolation) on an 85 ms window. When it agrees with the spectral peak within 3 percent it supplies the final number, since it is more precise. When it disagrees it is ignored, because on short noisy belt plucks it tends to pick a subharmonic. It is used alone only for a very clean tone (clarity above 0.9).
 
 Each strum's reported value is the median of its frame readings over the decay. The history shows which estimator produced each value.
