@@ -80,6 +80,7 @@
       <span class="status" id="status">Click Start and allow microphone access.</span>
       <span>Level: <span class="meter"><i id="meter"></i></span></span>
       <span class="status">Noise floor: <span id="floorVal">—</span></span>
+      <span class="status" id="micProc"></span>
     </div>
   </div>
 
@@ -120,11 +121,12 @@
       <li>60 Hz mains hum has a harmonic at 120 Hz. If you see a steady 120 Hz with nothing plucked, that is hum, not the belt. Move away from power supplies or fans.</li>
       <li>Presets come from each printer's public docs and are only starting points. Check your own manual, and note that the frequency depends on where you pluck and how long the free span is.</li>
       <li>Every pluck lists its prominent peaks. Harmonics of the reading are labeled 2×, 3×. A higher peak that is not a harmonic is called out as "also N Hz": that is a second ringing part (the other belt, a longer span, the frame). If that is the belt, it is tighter than the reading says, so look at the spectrum before tightening further. Tones that were already present before the pluck (hum, fans) are ignored automatically.</li>
+      <li>When listening starts, the status line reports whether the browser honored the request for raw audio. Phone browsers often keep automatic gain control or noise suppression on, which lowers and flattens plucks. A dedicated recording app with processing disabled usually gives a cleaner signal; analyze its files with Analyze a recording.</li>
       <li>Record 10 s &amp; analyze captures the page's own microphone input and runs it through the same analysis used for files, and offers the recording to save. Use it to compare against a recording app: pluck while both are running and feed the app's file to Analyze a recording.</li>
       <li>The FFT peak reading is a second opinion. If it disagrees by a factor of 2 the detector may be picking an octave; trust the one nearest the strongest spectrum bump.</li>
     </ul>
   </details>
-  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v5 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
+  <div class="status" style="text-align:right;padding:4px 2px">Belt Strum Tuner v6 · <a href="https://github.com/yincrash/strum-analyzer" style="color:var(--muted)">source</a> · if this says an older version, reload the page</div>
 </div>
 
 <script>
@@ -692,7 +694,17 @@
       src.connect(anT); src.connect(anF);
       timeBuf = new Float32Array(anT.fftSize);
       freqBuf = new Float32Array(anF.frequencyBinCount);
-      setStatus(`Listening at ${ctx.sampleRate} Hz. Pluck the belt.`);
+      // report which processing the browser actually left on; phones often ignore the raw-audio request
+      let proc = '';
+      try {
+        const st = stream.getAudioTracks()[0].getSettings();
+        const on = ['autoGainControl', 'noiseSuppression', 'echoCancellation'].filter(k => st[k] === true);
+        const unknown = ['autoGainControl', 'noiseSuppression', 'echoCancellation'].filter(k => st[k] === undefined);
+        proc = on.length ? ` Warning: the browser kept ${on.map(k => k.replace(/([A-Z])/g, ' $1').toLowerCase()).join(', ')} ON; readings may be attenuated or distorted.`
+             : unknown.length === 3 ? ' The browser did not report whether mic processing is off.' : ' Mic processing (gain control, noise suppression, echo cancellation) is off.';
+        $('micProc').textContent = proc.trim();
+      } catch (e) {}
+      setStatus(`Listening at ${ctx.sampleRate} Hz. Pluck the belt.` + proc);
       $('startBtn').textContent = 'Stop';
       $('toneBtn').disabled = false;
       $('recBtn').disabled = false;
