@@ -19,6 +19,7 @@
   label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   input[type=number] { width: 70px; background: #0e1114; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; font-size: 14px; }
   input[type=range] { width: 140px; }
+  input[type=file] { font-size: 13px; color: var(--muted); max-width: 260px; }
   select { background: #0e1114; color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; font-size: 14px; max-width: 100%; }
   button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 16px; font-size: 15px; font-weight: 600; cursor: pointer; }
   button.secondary { background: #2a3038; color: var(--fg); font-weight: 500; }
@@ -67,8 +68,12 @@
     <div class="row" style="margin-top:10px">
       <label>Search range <input type="number" id="smin" value="40" step="1"> – <input type="number" id="smax" value="400" step="1"> Hz</label>
       <label>Gate <input type="range" id="gate" min="-80" max="-20" value="-50" step="1"> <span id="gateVal">-50</span> dB</label>
+      <label>Min clarity <input type="range" id="clarity" min="0.3" max="0.95" value="0.6" step="0.05"> <span id="clarityVal">0.60</span></label>
     </div>
-    <div class="row" style="margin-top:4px"><span class="status">Pitches outside the search range are ignored and the spectrum plot spans it. Narrow it if the detector locks onto a harmonic or room noise.</span></div>
+    <div class="row" style="margin-top:10px">
+      <label>Analyze a recording <input type="file" id="fileIn" accept="audio/*,.m4a,.wav,.mp3,.ogg,.aac,.caf"></label>
+    </div>
+    <div class="row" style="margin-top:4px"><span class="status">Pitches outside the search range are ignored and the spectrum plot spans it. Narrow it if the detector locks onto a harmonic or room noise. Min clarity sets how clean a tone must be for the pitch detector; The reading is the strongest spectral peak standing 12 dB above the background, refined by the pitch detector when the two agree.</span></div>
     <div class="row" style="margin-top:8px">
       <span class="status" id="status">Click Start and allow microphone access.</span>
       <span>Level: <span class="meter"><i id="meter"></i></span></span>
@@ -105,7 +110,8 @@
     <ul>
       <li>Hold the phone or laptop mic a few cm from the belt and pluck it like a guitar string.</li>
       <li>If the level meter never turns green, lower the Gate slider. If it is always green from room noise, raise it.</li>
-      <li>Clarity near 1.0 means a clean tone. Readings below 0.85 clarity are ignored.</li>
+      <li>Clarity near 1.0 means a clean tone. Belt plucks often ring for only 100–200 ms, so clarity of 0.6–0.8 is normal. Readings with clarity below the Min clarity slider fall back to the strongest spectral peak.</li>
+      <li>You can also pick a voice memo or other recording with Analyze a recording. Each pluck in the file is listed in the history and the loudest one's spectrum is drawn.</li>
       <li>60 Hz mains hum has a harmonic at 120 Hz. If you see a steady 120 Hz with nothing plucked, that is hum, not the belt. Move away from power supplies or fans.</li>
       <li>Presets come from each printer's public docs and are only starting points. Check your own manual, and note that the frequency depends on where you pluck and how long the free span is.</li>
       <li>The FFT peak reading is a second opinion. If it disagrees by a factor of 2 the detector may be picking an octave; trust the one nearest the strongest spectrum bump.</li>
@@ -116,8 +122,8 @@
 <script>
 (function () {
   const $ = id => document.getElementById(id);
-  const CLARITY_MIN = 0.85;
   const EVENT_MAX_MS = 2000;
+  const FFT_PROMINENCE_DB = 12;     // FFT peak must stand this far above the median level in the search range
   const STORE_KEY = 'belt-strum-tuner';
 
   // Target presets. lo/hi in Hz. Sources are listed in the README.
@@ -136,7 +142,7 @@
 
   let ctx = null, stream = null, anT = null, anF = null, osc = null;
   let timeBuf, freqBuf, raf = null;
-  let ev = null;           // current strum event {start, samples:[]}
+  let ev = null;           // current strum event {start, pitch:[], fft:[]}
   let lastHz = null, liveHz = null;
   const history = [];
 
@@ -149,19 +155,26 @@
     for (let i = 0; i < n; i++) y[i] -= mean;
     return y;
   }
+  function removeMean(x) {
+    const y = new Float32Array(x.length); let mean = 0;
+    for (let i = 0; i < x.length; i++) mean += x[i];
+    mean /= x.length;
+    for (let i = 0; i < x.length; i++) y[i] = x[i] - mean;
+    return y;
+  }
 
   // McLeod Pitch Method: normalized square difference function + key-maximum picking.
   function mpm(x, sr, fmin, fmax) {
     const n = x.length;
     const minLag = Math.max(2, Math.floor(sr / fmax));
     const maxLag = Math.min(n - 2, Math.ceil(sr / fmin));
+    if (maxLag <= minLag) return null;
     const nsdf = new Float32Array(maxLag + 2);
     for (let tau = 1; tau <= maxLag + 1; tau++) {
       let acf = 0, m = 0;
       for (let i = 0, j = tau; j < n; i++, j++) { const a = x[i], b = x[j]; acf += a * b; m += a * a + b * b; }
       nsdf[tau] = m > 0 ? 2 * acf / m : 0;
     }
-    // key maxima between positive- and negative-going zero crossings, after the first negative crossing
     const maxima = [];
     let tau = 1;
     while (tau <= maxLag && nsdf[tau] > 0) tau++;
@@ -184,15 +197,32 @@
     return { freq: sr / period, clarity };
   }
 
+  // Strongest spectral peak in [fmin,fmax] with parabolic interpolation and prominence above the median level.
   function fftPeak(db, binHz, fmin, fmax) {
     const k0 = Math.max(1, Math.floor(fmin / binHz)), k1 = Math.min(db.length - 2, Math.ceil(fmax / binHz));
+    if (k1 <= k0) return null;
     let best = -1, bestVal = -Infinity;
     for (let k = k0; k <= k1; k++) if (db[k] > bestVal) { bestVal = db[k]; best = k; }
-    if (best < 0) return null;
+    if (best < 0 || !isFinite(bestVal)) return null;
     const a = db[best - 1], b = db[best], c = db[best + 1];
     const denom = a - 2 * b + c;
     const shift = denom !== 0 ? 0.5 * (a - c) / denom : 0;
-    return { freq: (best + shift) * binHz, db: bestVal };
+    const med = median(Array.from(db.subarray(k0, k1 + 1)).filter(isFinite));
+    return { freq: (best + shift) * binHz, db: bestVal, prominence: bestVal - med };
+  }
+
+  // Direct DFT in dB at 1 Hz steps (Hann window). Used for recordings, where there is no AnalyserNode.
+  function dftSpectrum(seg, sr, fmax) {
+    const N = seg.length, out = new Float32Array(fmax + 2);
+    const w = new Float32Array(N);
+    for (let i = 0; i < N; i++) w[i] = (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1))) * seg[i];
+    for (let f = 0; f < out.length; f++) {
+      let re = 0, im = 0; const k = 2 * Math.PI * f / sr;
+      const cs = Math.cos(k), sn = Math.sin(k); let c = 1, s = 0;   // rotating phasor
+      for (let i = 0; i < N; i++) { re += w[i] * c; im -= w[i] * s; const c2 = c * cs - s * sn; s = s * cs + c * sn; c = c2; }
+      out[f] = 20 * Math.log10(Math.hypot(re, im) / N * 4 + 1e-12);
+    }
+    return out;
   }
 
   function rmsDb(x) {
@@ -208,11 +238,31 @@
   }
 
   function median(arr) {
+    if (!arr.length) return NaN;
     const s = arr.slice().sort((a, b) => a - b), m = s.length >> 1;
     return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
   }
 
-  // ---------- UI helpers ----------
+  // One frame's candidate reading. The strongest prominent spectral peak is the primary estimate;
+  // the pitch detector refines it when the two agree, and stands alone only for a very clean tone.
+  // (Belt plucks are short and noisy; on real recordings the pitch detector alone often picks a subharmonic.)
+  function candidate(p, fp, clarityMin) {
+    const peakOk = fp && fp.prominence >= FFT_PROMINENCE_DB;
+    const pitchOk = p && p.clarity >= clarityMin;
+    if (peakOk && pitchOk && Math.abs(p.freq - fp.freq) <= 0.03 * fp.freq) return { hz: p.freq, src: 'pitch' };
+    if (peakOk) return { hz: fp.freq, src: 'peak' };
+    if (p && p.clarity >= Math.max(clarityMin, 0.9)) return { hz: p.freq, src: 'pitch' };
+    return null;
+  }
+  // Summarize a strum event into one reading.
+  function summarize(e) {
+    if (e.pitch.length >= 2) return { hz: median(e.pitch), src: 'peak+pitch', n: e.pitch.length };
+    if (e.fft.length >= 1) return { hz: median(e.fft), src: 'peak', n: e.fft.length };
+    if (e.pitch.length === 1) return { hz: e.pitch[0], src: 'pitch', n: 1 };
+    return null;
+  }
+
+  // ---------- Settings ----------
   function targets() {
     let lo = parseFloat($('tmin').value), hi = parseFloat($('tmax').value);
     if (!(lo < hi)) { lo = 110; hi = 120; }
@@ -223,11 +273,11 @@
     if (!(lo >= 20) || !(hi > lo + 10) || hi > 2000) { lo = 40; hi = 400; }
     return { lo, hi };
   }
+  function clarityMin() { return parseFloat($('clarity').value) || 0.6; }
+  function gateDb() { return parseFloat($('gate').value); }
 
-  // ---------- Presets and persistence ----------
   function buildPresets() {
-    const sel = $('preset');
-    sel.innerHTML = PRESETS.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+    $('preset').innerHTML = PRESETS.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
   }
   function applyPreset(id) {
     const p = PRESETS.find(x => x.id === id) || PRESETS[0];
@@ -246,7 +296,7 @@
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
         preset: $('preset').value, tmin: $('tmin').value, tmax: $('tmax').value,
-        smin: $('smin').value, smax: $('smax').value, gate: $('gate').value
+        smin: $('smin').value, smax: $('smax').value, gate: $('gate').value, clarity: $('clarity').value
       }));
     } catch (e) {}
   }
@@ -259,9 +309,14 @@
     if (st.tmax != null) $('tmax').value = st.tmax;
     if (st.smin != null) $('smin').value = st.smin;
     if (st.smax != null) $('smax').value = st.smax;
-    if (st.gate != null) { $('gate').value = st.gate; $('gateVal').textContent = st.gate; }
+    if (st.gate != null) $('gate').value = st.gate;
+    if (st.clarity != null) $('clarity').value = st.clarity;
+    $('gateVal').textContent = $('gate').value;
+    $('clarityVal').textContent = parseFloat($('clarity').value).toFixed(2);
     markCustomIfChanged();
   }
+
+  // ---------- UI ----------
   function verdict(f) {
     const { lo, hi } = targets();
     if (f < lo) return { text: 'TOO LOOSE: tighten', cls: 'low' };
@@ -283,13 +338,11 @@
       const l = document.createElement('div'); l.className = 'tl'; l.style.left = gaugePct(f) + '%'; l.textContent = f; g.appendChild(l);
     }
   }
-
   function setNeedle(id, f) {
     const n = $(id);
     if (f == null) { n.style.display = 'none'; return; }
     n.style.display = 'block'; n.style.left = gaugePct(f) + '%';
   }
-
   function renderLast() {
     if (lastHz == null) { $('lastHz').textContent = '—'; $('verdict').textContent = ''; $('verdict').className = 'verdict'; setNeedle('needleLast', null); return; }
     $('lastHz').textContent = lastHz.toFixed(1);
@@ -297,20 +350,24 @@
     $('verdict').textContent = v.text; $('verdict').className = 'verdict ' + v.cls;
     setNeedle('needleLast', lastHz);
   }
-
   function renderHistory() {
     const h = $('hist');
     if (!history.length) { h.innerHTML = '<div style="color:var(--muted)">No strums yet.</div>'; return; }
-    h.innerHTML = history.slice(-12).reverse().map((e, i) => {
+    h.innerHTML = history.slice(-20).reverse().map(e => {
       const v = verdict(e.hz);
-      return `<div><span style="color:var(--muted);width:70px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.n} samples</span></div>`;
+      return `<div><span style="color:var(--muted);width:90px">${e.time}</span><span style="width:80px"><b>${e.hz.toFixed(1)}</b> Hz</span><span class="${v.cls}">${v.text}</span><span style="color:var(--muted)">${e.src}, ${e.n} frames</span></div>`;
     }).join('');
   }
-
+  function addResult(time, r) {
+    lastHz = r.hz;
+    history.push({ time, hz: r.hz, src: r.src, n: r.n });
+    renderLast(); renderHistory();
+  }
   function setStatus(msg, err) { const s = $('status'); s.textContent = msg; s.className = 'status' + (err ? ' err' : ''); }
 
   // ---------- Spectrum ----------
   const canvas = $('spec'), c2d = canvas.getContext('2d');
+  let heldSpectrum = null;   // {db, binHz, markHz} shown after a recording is analyzed
   function drawSpectrum(db, binHz, markHz) {
     const dpr = window.devicePixelRatio || 1;
     const W = canvas.clientWidth, H = canvas.clientHeight;
@@ -323,7 +380,6 @@
     const xOf = f => f / SPEC_MAX_HZ * W;
     c2d.fillStyle = 'rgba(63,191,111,0.18)';
     c2d.fillRect(xOf(lo), 0, xOf(hi) - xOf(lo), H);
-    // grid
     c2d.strokeStyle = 'rgba(255,255,255,0.08)'; c2d.fillStyle = '#8a919a'; c2d.font = '10px sans-serif';
     for (let f = gridStep; f < SPEC_MAX_HZ; f += gridStep) {
       c2d.beginPath(); c2d.moveTo(xOf(f), 0); c2d.lineTo(xOf(f), H); c2d.stroke();
@@ -331,7 +387,8 @@
     }
     if (db) {
       const kMax = Math.min(db.length - 1, Math.ceil(SPEC_MAX_HZ / binHz));
-      const dbMin = -100, dbMax = -10;
+      let top = -Infinity; for (let k = 0; k <= kMax; k++) if (isFinite(db[k]) && db[k] > top) top = db[k];
+      const dbMax = Math.max(-10, Math.ceil(top / 10) * 10), dbMin = dbMax - 90;
       c2d.beginPath();
       for (let k = 0; k <= kMax; k++) {
         const y = H - (Math.min(dbMax, Math.max(dbMin, db[k])) - dbMin) / (dbMax - dbMin) * H;
@@ -345,47 +402,107 @@
       c2d.beginPath(); c2d.moveTo(xOf(markHz), 0); c2d.lineTo(xOf(markHz), H); c2d.stroke();
     }
   }
+  function redrawIdleSpectrum() {
+    if (heldSpectrum) drawSpectrum(heldSpectrum.db, heldSpectrum.binHz, heldSpectrum.markHz); else drawSpectrum(null, 1, null);
+  }
 
-  // ---------- Main loop ----------
+  // ---------- Live loop ----------
   function loop() {
     raf = requestAnimationFrame(loop);
     anT.getFloatTimeDomainData(timeBuf);
     anF.getFloatFrequencyData(freqBuf);
     const level = rmsDb(timeBuf);
-    const gateDb = parseFloat($('gate').value);
-    const open = level > gateDb;
+    const open = level > gateDb();
     const meter = $('meter');
     meter.style.width = Math.min(100, Math.max(0, (level + 80) / 80 * 100)) + '%';
     meter.className = open ? 'open' : '';
 
+    const { lo: SEARCH_MIN, hi: SEARCH_MAX } = searchRange();
     const x = decimate2(timeBuf);
     const sr = ctx.sampleRate / 2;
     const binHz = ctx.sampleRate / anF.fftSize;
-    const { lo: SEARCH_MIN, hi: SEARCH_MAX } = searchRange();
-    let p = open ? mpm(x, sr, SEARCH_MIN, SEARCH_MAX) : null;
+    const p = open ? mpm(x, sr, SEARCH_MIN, SEARCH_MAX) : null;
     const fp = open ? fftPeak(freqBuf, binHz, SEARCH_MIN, SEARCH_MAX) : null;
-    const good = p && p.clarity >= CLARITY_MIN && p.freq >= SEARCH_MIN && p.freq <= SEARCH_MAX;
+    const cand = open ? candidate(p, fp, clarityMin()) : null;
 
-    liveHz = good ? p.freq : null;
-    $('liveHz').textContent = good ? p.freq.toFixed(1) : '—';
-    $('liveNote').textContent = good ? noteName(p.freq) : '—';
+    liveHz = cand ? cand.hz : null;
+    $('liveHz').textContent = cand ? cand.hz.toFixed(1) : '—';
+    $('liveNote').textContent = cand ? noteName(cand.hz) : '—';
     $('liveClar').textContent = p ? p.clarity.toFixed(2) : '—';
     $('fftHz').textContent = fp ? fp.freq.toFixed(1) : '—';
     setNeedle('needleLive', liveHz);
-    drawSpectrum(open ? freqBuf : null, binHz, liveHz);
+    if (open) { heldSpectrum = null; drawSpectrum(freqBuf, binHz, liveHz); } else redrawIdleSpectrum();
 
-    // strum event tracking
     const now = performance.now();
-    if (open && !ev) ev = { start: now, samples: [] };
-    if (ev && good) ev.samples.push(p.freq);
+    if (open && !ev) ev = { start: now, pitch: [], fft: [] };
+    if (ev && cand) (cand.src === 'pitch' ? ev.pitch : ev.fft).push(cand.hz);
     if (ev && (!open || now - ev.start > EVENT_MAX_MS)) {
-      if (ev.samples.length >= 3) {
-        lastHz = median(ev.samples);
-        history.push({ time: new Date().toLocaleTimeString(), hz: lastHz, n: ev.samples.length });
-        renderLast(); renderHistory();
-      }
+      const r = summarize(ev);
+      if (r) addResult(new Date().toLocaleTimeString(), r);
       ev = null;
     }
+  }
+
+  // ---------- Recording analysis (same pipeline, offline) ----------
+  function analyzeSamples(x0, sr0, opts) {
+    // x0: mono Float32Array at sr0. Returns { events:[{t, hz, src, n, peakLevel}], spectrum:{db, binHz, markHz} }
+    let x = x0, sr = sr0;
+    if (sr0 > 30000) { x = decimate2(x0); sr = sr0 / 2; }
+    const win = Math.round(sr * 0.085), hop = Math.round(sr * 0.02);
+    const { lo: fmin, hi: fmax } = opts.search;
+    const frames = [];
+    for (let s0 = 0; s0 + win <= x.length; s0 += hop) {
+      const seg = removeMean(x.subarray(s0, s0 + win));
+      const level = rmsDb(seg);
+      const p = level > opts.gate ? mpm(seg, sr, fmin, fmax) : null;
+      frames.push({ t: s0 / sr, s0, level, p });
+    }
+    const events = [];
+    let e = null;
+    const finish = (e) => {
+      // spectral peak over 0.3 s from the loudest frame, then pitch readings that agree with it
+      const seg = removeMean(x.subarray(e.peakS0, Math.min(x.length, e.peakS0 + Math.round(sr * 0.3))));
+      const db = dftSpectrum(seg, sr, Math.ceil(fmax));
+      const fp = fftPeak(db, 1, fmin, fmax);
+      const peakOk = fp && fp.prominence >= FFT_PROMINENCE_DB;
+      const pitch = peakOk
+        ? e.pitch.filter(q => q.clarity >= opts.clarity && Math.abs(q.freq - fp.freq) <= 0.03 * fp.freq)
+        : e.pitch.filter(q => q.clarity >= Math.max(opts.clarity, 0.9));
+      const r = summarize({ pitch: pitch.map(q => q.freq), fft: peakOk ? [fp.freq] : [] });
+      if (r) events.push({ t: e.t, hz: r.hz, src: r.src, n: r.n, peakLevel: e.peakLevel, db, fp });
+    };
+    for (const f of frames) {
+      const open = f.level > opts.gate;
+      if (open && !e) e = { t: f.t, pitch: [], fft: [], peakLevel: -Infinity, peakS0: f.s0 };
+      if (e && open && f.level > e.peakLevel) { e.peakLevel = f.level; e.peakS0 = f.s0; }
+      if (e && open && f.p) e.pitch.push(f.p);
+      if (e && (!open || (f.t - e.t) * 1000 > EVENT_MAX_MS)) { finish(e); e = null; }
+    }
+    if (e) finish(e);
+    return events;
+  }
+
+  async function analyzeFile(file) {
+    setStatus(`Decoding ${file.name}…`);
+    let ac = null;
+    try {
+      ac = new (window.AudioContext || window.webkitAudioContext)();
+      const audio = await ac.decodeAudioData(await file.arrayBuffer());
+      const n = audio.length, mono = new Float32Array(n);
+      for (let ch = 0; ch < audio.numberOfChannels; ch++) { const d = audio.getChannelData(ch); for (let i = 0; i < n; i++) mono[i] += d[i] / audio.numberOfChannels; }
+      setStatus(`Analyzing ${file.name} (${(n / audio.sampleRate).toFixed(1)} s at ${audio.sampleRate} Hz)…`);
+      await new Promise(r => setTimeout(r, 30));
+      const events = analyzeSamples(mono, audio.sampleRate, { search: searchRange(), gate: gateDb(), clarity: clarityMin() });
+      if (!events.length) { setStatus(`No strums found in ${file.name}. Try lowering the gate or the clarity threshold.`, true); return; }
+      for (const e of events) addResult(`file ${e.t.toFixed(2)}s`, e);
+      const loudest = events.reduce((a, b) => b.peakLevel > a.peakLevel ? b : a);
+      heldSpectrum = { db: loudest.db, binHz: 1, markHz: loudest.hz };
+      redrawIdleSpectrum();
+      const hz = events.map(e => e.hz);
+      setStatus(`${file.name}: ${events.length} strums, median ${median(hz).toFixed(1)} Hz (range ${Math.min(...hz).toFixed(1)}–${Math.max(...hz).toFixed(1)}). Spectrum shows the loudest strum.`);
+    } catch (err) {
+      setStatus('Could not analyze file: ' + (err.message || err), true);
+    } finally { if (ac) ac.close(); }
   }
 
   // ---------- Start / stop ----------
@@ -397,7 +514,7 @@
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
       });
       const src = ctx.createMediaStreamSource(stream);
-      anT = ctx.createAnalyser(); anT.fftSize = 8192; anT.smoothingTimeConstant = 0;
+      anT = ctx.createAnalyser(); anT.fftSize = 4096; anT.smoothingTimeConstant = 0;     // ~85 ms window: belt plucks ring briefly
       anF = ctx.createAnalyser(); anF.fftSize = 32768; anF.smoothingTimeConstant = 0.5;
       src.connect(anT); src.connect(anF);
       timeBuf = new Float32Array(anT.fftSize);
@@ -421,7 +538,7 @@
     $('toneBtn').disabled = true;
     $('meter').style.width = '0';
     setNeedle('needleLive', null);
-    drawSpectrum(null, 1, null);
+    redrawIdleSpectrum();
   }
   function stopTone() {
     if (osc) { osc.stop(); osc.disconnect(); osc = null; $('toneBtn').textContent = 'Play 115 Hz test tone'; }
@@ -437,19 +554,24 @@
 
   $('startBtn').addEventListener('click', () => ctx ? stop() : start());
   $('toneBtn').addEventListener('click', toggleTone);
-  $('clearBtn').addEventListener('click', () => { history.length = 0; lastHz = null; renderLast(); renderHistory(); });
+  $('clearBtn').addEventListener('click', () => { history.length = 0; lastHz = null; heldSpectrum = null; renderLast(); renderHistory(); redrawIdleSpectrum(); });
   $('gate').addEventListener('input', () => { $('gateVal').textContent = $('gate').value; saveSettings(); });
+  $('clarity').addEventListener('input', () => { $('clarityVal').textContent = parseFloat($('clarity').value).toFixed(2); saveSettings(); });
   $('preset').addEventListener('change', () => { applyPreset($('preset').value); drawGaugeStatic(); renderLast(); renderHistory(); saveSettings(); });
   ['tmin', 'tmax'].forEach(id => $(id).addEventListener('change', () => { markCustomIfChanged(); drawGaugeStatic(); renderLast(); renderHistory(); saveSettings(); }));
-  ['smin', 'smax'].forEach(id => $(id).addEventListener('change', () => { drawSpectrum(null, 1, null); saveSettings(); }));
-  window.addEventListener('resize', () => drawSpectrum(null, 1, null));
+  ['smin', 'smax'].forEach(id => $(id).addEventListener('change', () => { redrawIdleSpectrum(); saveSettings(); }));
+  $('fileIn').addEventListener('change', () => { const f = $('fileIn').files[0]; if (f) analyzeFile(f); $('fileIn').value = ''; });
+  window.addEventListener('resize', () => redrawIdleSpectrum());
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    setStatus('This browser does not expose the microphone here. Serve the page over http://localhost or https.', true);
+    setStatus('This browser does not expose the microphone here. Serve the page over http://localhost or https. Analyzing a recording still works.', true);
     $('startBtn').disabled = true;
   }
   buildPresets(); loadSettings();
-  drawGaugeStatic(); renderLast(); drawSpectrum(null, 1, null);
+  drawGaugeStatic(); renderLast(); redrawIdleSpectrum();
+
+  // exposed for tests
+  window.BeltTuner = { mpm, fftPeak, dftSpectrum, decimate2, analyzeSamples, median };
 })();
 </script>
 </body>

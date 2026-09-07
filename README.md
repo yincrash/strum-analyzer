@@ -14,6 +14,8 @@ Everything runs in the browser. No audio leaves your device.
 4. Read the **Last strum** number. It is the median of the readings taken while the belt was ringing. The verdict tells you whether to tighten or loosen.
 5. Adjust, pluck again, and compare against the history list.
 
+You can also analyze an existing recording, such as a phone voice memo, with **Analyze a recording**. Every pluck found in the file is added to the history and the loudest one's spectrum is drawn.
+
 ## Presets
 
 | Printer | Target | Note |
@@ -42,13 +44,19 @@ Sources:
 - **Target**: the acceptable band. Filled in by the preset; editing it switches the preset to Custom.
 - **Search range**: pitches outside this range are ignored, and the spectrum plot spans it. Narrow it if the detector locks onto a harmonic or room noise.
 - **Gate**: input level below which nothing is measured. Lower it if the level bar never turns green; raise it if room noise keeps it green.
+- **Min clarity**: how clean a tone the pitch detector needs before its value is used to refine the spectral peak. Belt plucks ring for only 100–200 ms, so 0.6 is a reasonable default.
 - **Test tone**: plays 115 Hz through the speakers so you can confirm the mic and detector agree.
 
 Settings are remembered in the browser.
 
 ## How it works
 
-The pitch detector is the McLeod Pitch Method (normalized square difference with key-maximum picking and parabolic interpolation) on the raw waveform, decimated to half the mic sample rate. It handles belt plucks well because the second harmonic is often louder than the fundamental, which fools a plain FFT peak. An FFT peak is shown alongside as a sanity check. Readings with clarity below 0.85 are discarded, and each strum's reported value is the median over its decay.
+Two estimators run on every frame while the input is above the gate:
+
+- **Spectral peak**: the strongest peak in the search range of a 32768-point FFT, parabolic-interpolated, and only accepted when it stands at least 12 dB above the median level in the range. This is the primary reading and matches how the printer communities measure belts with spectrum-analyzer apps.
+- **Pitch detector**: the McLeod Pitch Method (normalized square difference, key-maximum picking, parabolic interpolation) on an 85 ms window. When it agrees with the spectral peak within 3 percent it supplies the final number, since it is more precise. When it disagrees it is ignored, because on short noisy belt plucks it tends to pick a subharmonic. It is used alone only for a very clean tone (clarity above 0.9).
+
+Each strum's reported value is the median of its frame readings over the decay. The history shows which estimator produced each value.
 
 ## Tips
 
